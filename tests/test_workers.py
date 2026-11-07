@@ -76,7 +76,7 @@ class ProcessSupervisorTests(unittest.TestCase):
             "import json, os, sys; "
             "open(sys.argv[1], 'w').write(json.dumps({key: os.environ.get(key) "
             "for key in ('NEO_WORKER', 'NEO_TASK_ID', 'NEO_TASK_TOKEN')})); "
-            "print('worker-stdout', flush=True)"
+            "print('worker-stdout', flush=True); import time; time.sleep(0.2)"
         )
 
         submitted = self.supervisor.submit(
@@ -106,7 +106,7 @@ class ProcessSupervisorTests(unittest.TestCase):
         self.assertTrue(self.tokens.verify(task["id"], environment["NEO_TASK_TOKEN"]))
         self.assertNotIn(environment["NEO_TASK_TOKEN"], Path(worker["log_path"]).read_text())
         self.assertIn("worker-stdout", Path(worker["log_path"]).read_text())
-        self.assertEqual(self.registry.get_task(task["id"])["state"], "running")
+        self.wait_for(lambda: self._task_in_state(task["id"], "failed"))
 
     def test_queued_argv_drains_when_capacity_is_released(self) -> None:
         first = self.create_task("first")
@@ -117,13 +117,6 @@ class ProcessSupervisorTests(unittest.TestCase):
 
         self.supervisor.submit(
             first["id"], [sys.executable, "-c", "import time; time.sleep(0.15)"]
-        )
-        running = self.registry.get_task(first["id"])
-        self.service.transition(
-            first["id"],
-            "completed",
-            expected_version=running["version"],
-            evidence=CompletionEvidence(executor_confirmed=True),
         )
         queued = self.supervisor.submit(
             second["id"],
@@ -141,7 +134,133 @@ class ProcessSupervisorTests(unittest.TestCase):
 
         self.wait_for(second_receipt)
         self.assertEqual(marker.read_text(), "ran")
-        self.assertEqual(self.registry.get_task(second["id"])["state"], "running")
+        self.wait_for(lambda: self._task_in_state(second["id"], "failed"))
+
+    def test_external_capacity_release_drains_a_pending_task(self) -> None:
+        holder = self.create_task("holder")
+        waiter = self.create_task("waiter")
+        marker = self.root / "externally-released.txt"
+        self.supervisor.submit(
+            waiter["id"],
+            [sys.executable, "-c", "import sys; open(sys.argv[1], 'w').write('ran')", str(marker)],
+        )
+        self.assertEqual(self.registry.get_task(waiter["id"])["state"], "queued")
+
+        running = self.registry.get_task(holder["id"])
+        running = self.service.transition(
+            holder["id"], "running", expected_version=running["version"]
+        )
+        self.service.transition(
+            holder["id"],
+            "completed",
+            expected_version=running["version"],
+            evidence=CompletionEvidence(executor_confirmed=True),
+        )
+
+        self.wait_for(
+            lambda: self.supervisor.get_worker(waiter["id"]) is not None
+        )
+        self.wait_for(marker.exists)
+        self.assertIn(
+            self.registry.get_task(waiter["id"])["state"], {"running", "failed"}
+        )
+        self.assertEqual(marker.read_text(), "ran")
+
+    def test_spawn_failure_releases_capacity_for_the_next_task(self) -> None:
+        failed_task = self.create_task("will-fail")
+        next_task = self.create_task("next")
+
+        failed = self.supervisor.submit(
+            failed_task["id"], [str(self.root / "missing-binary")]
+        )
+        self.assertEqual(failed["state"], "failed")
+        queued = self.supervisor.submit(
+            next_task["id"], [sys.executable, "-c", "pass"]
+        )
+        self.assertIn(queued["state"], {"running", "failed"})
+        self.wait_for(
+            lambda: self.supervisor.get_worker(next_task["id"]) is not None
+        )
+
+    def test_invalid_log_directory_fails_task_and_releases_capacity(self) -> None:
+        blocker = self.root / "not-a-directory"
+        blocker.write_text("file")
+        supervisor = ProcessSupervisor(
+            self.service, self.tokens, log_dir=blocker
+        )
+        self.addCleanup(supervisor.close)
+        task = self.create_task("bad-log")
+
+        failed = supervisor.submit(task["id"], [sys.executable, "-c", "pass"])
+
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(
+            self.registry.get_task(task["id"])["state"], "failed"
+        )
+        following = self.create_task("following")
+        self.assertEqual(following["state"], "starting")
+
+    def test_embedded_nul_argv_is_failed_not_stranded(self) -> None:
+        task = self.create_task()
+
+        failed = self.supervisor.submit(
+            task["id"], [sys.executable, "-c", "pass\0hidden"]
+        )
+
+        self.assertEqual(failed["state"], "failed")
+        self.assertIsNone(self.supervisor.get_worker(task["id"])["pid"])
+
+    def test_watcher_survives_a_running_transition_fault(self) -> None:
+        task = self.create_task()
+        original = self.service.transition
+
+        def faulty(task_id, target, **kwargs):
+            if target == "running":
+                raise RuntimeError("simulated post-commit fault")
+            return original(task_id, target, **kwargs)
+
+        with mock.patch.object(self.service, "transition", faulty):
+            self.supervisor.submit(
+                task["id"], [sys.executable, "-c", "import time; time.sleep(0.1)"]
+            )
+
+        self.wait_for(lambda: self._task_in_state(task["id"], "failed"))
+        worker = self.supervisor.get_worker(task["id"])
+        receipt = Path(worker["log_path"]).with_suffix(".receipt.json")
+        self.assertTrue(receipt.exists())
+
+    def test_cancelling_a_completed_task_is_idempotent(self) -> None:
+        task = self.create_task()
+        self.supervisor.submit(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(0.2)"]
+        )
+        running = self.registry.get_task(task["id"])
+        completed = self.service.transition(
+            task["id"],
+            "completed",
+            expected_version=running["version"],
+            evidence=CompletionEvidence(executor_confirmed=True),
+        )
+
+        self.assertEqual(self.supervisor.cancel(task["id"]), completed)
+        self.wait_for(
+            lambda: self.supervisor.get_worker(task["id"])["state"] == "completed"
+        )
+
+    def test_close_leaves_the_detached_worker_and_watcher_running(self) -> None:
+        task = self.create_task()
+        marker = self.root / "detached-finished.txt"
+        self.supervisor.submit(
+            task["id"],
+            [sys.executable, "-c", "import sys,time; time.sleep(0.2); open(sys.argv[1], 'w').write('done')", str(marker)],
+        )
+        worker = self.supervisor.get_worker(task["id"])
+        self.supervisor.close()
+
+        self.wait_for(marker.exists)
+        receipt = Path(worker["log_path"]).with_suffix(".receipt.json")
+        self.wait_for(receipt.exists)
+        self.assertEqual(json.loads(receipt.read_text())["exit_code"], 0)
 
     def test_queued_cancellation_never_claims_process_execution(self) -> None:
         self.create_task("capacity-holder")
