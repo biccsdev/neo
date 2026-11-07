@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"id":"msg_01","role":"assistant","content":[{"type":"text","text":"OK"}]},"uuid":"c45ba0ec-35af-4e04-82e8-49b3808ae94c"}
+{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"OK","permission_denials":[],"terminal_reason":"completed"}

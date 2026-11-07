@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a1b80e-039e-78c1-87bf-555defb84f3a"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `gpt-6.1-terra` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"error","message":"The 'gpt-6.1-terra' model is not supported when using Codex with a ChatGPT account."}
+{"type":"turn.failed","error":{"message":"The 'gpt-6.1-terra' model is not supported when using Codex with a ChatGPT account."}}

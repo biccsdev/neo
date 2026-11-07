@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a1b80e-039e-78c1-87bf-555defb84f3a"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"python3 -V","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"python3 -V","aggregated_output":"Python 3.14.0\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Python 3.14.0 is installed."}}
