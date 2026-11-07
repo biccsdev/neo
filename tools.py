@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import secrets
 from typing import Optional, Union
 
@@ -64,7 +65,16 @@ class WorkerTaskTools:
 
     def __init__(self, service: TaskService, tokens: WorkerTokenStore) -> None:
         self._service = service
-        self._tokens = tokens
+
+    @staticmethod
+    def _validate_text(value: object, name: str) -> Optional[str]:
+        if value is not None and (
+            not isinstance(value, str) or len(value) > 4000
+        ):
+            raise WorkerToolError(
+                "%s must be a string of at most 4000 characters" % name
+            )
+        return value
 
     def neo_task_update(
         self,
@@ -72,9 +82,9 @@ class WorkerTaskTools:
         token: Optional[str],
         state: Union[TaskState, str],
         expected_version: int,
-        progress: Optional[float] = None,
-        detail: Optional[str] = None,
-        summary: Optional[str] = None,
+        progress: object = None,
+        detail: object = None,
+        summary: object = None,
         evidence: Optional[Evidence] = None,
     ) -> dict:
         """Apply one authenticated worker transition and optional progress event.
@@ -86,6 +96,13 @@ class WorkerTaskTools:
             raise InvalidWorkerTokenError(
                 "worker token rejected for task %s" % task_id
             )
+        detail = self._validate_text(detail, "detail")
+        summary = self._validate_text(summary, "summary")
+        if progress is not None:
+            if isinstance(progress, bool) or not isinstance(progress, (int, float)):
+                raise WorkerToolError("progress must be a finite number")
+            if isinstance(progress, float) and not math.isfinite(progress):
+                raise WorkerToolError("progress must be a finite number")
         event_extra = {}
         if progress is not None:
             event_extra["progress"] = progress

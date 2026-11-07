@@ -648,6 +648,13 @@ class Registry:
         nothing, and a failed event insert rolls the state change back.
         """
         connection = self._connect()
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 0
+        ):
+            connection.close()
+            raise ValueError("expected_version must be a non-negative integer")
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -659,8 +666,6 @@ class Registry:
                         "worker token rejected for task %s" % task_id
                     )
                 raise KeyError(task_id)
-            if row["version"] != expected_version:
-                raise VersionConflictError(task_id, expected_version, row["version"])
             if worker_token_digest is not None:
                 token_row = connection.execute(
                     "SELECT token_hash FROM task_worker_tokens WHERE task_id = ?",
@@ -672,6 +677,8 @@ class Registry:
                     raise InvalidWorkerTokenError(
                         "worker token rejected for task %s" % task_id
                     )
+            if row["version"] != expected_version:
+                raise VersionConflictError(task_id, expected_version, row["version"])
 
             target_state = _coerce_target(target)
             if row["state"] == "queued" and target_state == TaskState.STARTING:

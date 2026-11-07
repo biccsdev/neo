@@ -23,7 +23,7 @@ from state_machine import Evidence, TaskState, UnknownStateError
 TASK_CREATED = "task.created"
 TASK_UPDATED = "task.updated"
 
-TERMINAL_EVENT_NAMES = MappingProxyType(
+SPECIAL_EVENT_NAMES = MappingProxyType(
     {
         TaskState.COMPLETED: "task.completed",
         TaskState.FAILED: "task.failed",
@@ -31,7 +31,7 @@ TERMINAL_EVENT_NAMES = MappingProxyType(
         TaskState.NEEDS_APPROVAL: "task.approval_required",
     }
 )
-"""States that carry their own public event name; every other state is an update."""
+"""States with a specific public event name; every other state is an update."""
 
 
 def event_name_for(target: Union[TaskState, str]) -> str:
@@ -49,7 +49,7 @@ def event_name_for(target: Union[TaskState, str]) -> str:
         raise UnknownStateError(
             "task target state must be a state name, got %s" % type(target).__name__
         )
-    return TERMINAL_EVENT_NAMES.get(state, TASK_UPDATED)
+    return SPECIAL_EVENT_NAMES.get(state, TASK_UPDATED)
 
 
 def _decode_event(row: dict) -> dict:
@@ -154,7 +154,7 @@ class TaskService:
 __all__ = [
     "TASK_CREATED",
     "TASK_UPDATED",
-    "TERMINAL_EVENT_NAMES",
+    "SPECIAL_EVENT_NAMES",
     "TaskService",
     "event_name_for",
 ]

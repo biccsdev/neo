@@ -31,6 +31,7 @@ from tools import (  # noqa: E402
     InvalidWorkerTokenError,
     WorkerTaskTools,
     WorkerTokenStore,
+    WorkerToolError,
 )
 
 
@@ -215,6 +216,47 @@ class WorkerTokenTestCase(unittest.TestCase):
         self.assertEqual(len(recorded), 2)
 
     # -- worker_task_update ----------------------------------------------
+
+    def test_stale_version_does_not_bypass_token_authentication(self) -> None:
+        self.tokens.issue(self.task["id"])
+        running = self.service.transition(
+            self.task["id"], "running", expected_version=self.task["version"]
+        )
+
+        with self.assertRaises(InvalidWorkerTokenError):
+            self.tools.neo_task_update(
+                self.task["id"],
+                "wrong-token",
+                state="waiting",
+                expected_version=self.task["version"],
+            )
+
+        self.assertEqual(self.registry.get_task(self.task["id"]), running)
+        self.assertEqual(len(self.task_events(self.task["id"])), 2)
+
+    def test_invalid_worker_payload_is_a_domain_error_without_changes(self) -> None:
+        token = self.tokens.issue(self.task["id"])
+        invalid_payloads = (
+            {"progress": object()},
+            {"progress": float("nan")},
+            {"progress": True},
+            {"detail": object()},
+            {"detail": "x" * 4001},
+            {"summary": object()},
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(WorkerToolError):
+                    self.tools.neo_task_update(
+                        self.task["id"],
+                        token,
+                        state="running",
+                        expected_version=self.task["version"],
+                        **payload,
+                    )
+                self.assertEqual(self.registry.get_task(self.task["id"]), self.task)
+                self.assertEqual(len(self.task_events(self.task["id"])), 1)
 
     def test_public_update_tool_reports_progress_and_detail(self) -> None:
         token = self.tokens.issue(self.task["id"])

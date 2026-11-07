@@ -138,6 +138,19 @@ class RegistryTestCase(unittest.TestCase):
         self.assertFalse(self.registry.delete_task(created_ids[0]))
         self.assertEqual(len(self.registry.list_tasks()), 7)
 
+    def test_transition_requires_an_integer_expected_version(self) -> None:
+        task = self.registry.create_task(
+            conversation_key="conv", kind="coding", intent="typed version"
+        )
+
+        for version in (True, 1.0, "1", None):
+            with self.subTest(version=version):
+                with self.assertRaises(ValueError):
+                    self.registry.transition_task(
+                        task["id"], "running", expected_version=version
+                    )
+                self.assertEqual(self.registry.get_task(task["id"]), task)
+
     def test_optimistic_version_conflict_is_rejected(self) -> None:
         task = self.registry.create_task(
             conversation_key="conversation", kind="coding", intent="change me"
