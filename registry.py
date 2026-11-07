@@ -230,6 +230,14 @@ _SCHEMA = (
         granted_at REAL NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS task_worker_tokens (
+        task_id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL,
+        issued_at REAL NOT NULL,
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    )
+    """,
 )
 
 
@@ -274,6 +282,60 @@ def _coerce_target(value: Union[TaskState, str]) -> TaskState:
             raise UnknownStateError("unknown task target state: %r" % value) from None
     raise UnknownStateError(
         "task target state must be a state name, got %s" % type(value).__name__
+    )
+
+
+def _coerce_cursor(since: object) -> int:
+    """Return a validated event cursor; ``bool`` is refused as an integer."""
+    if isinstance(since, bool):
+        raise InvalidCursorError("event cursor must be a non-negative integer")
+    if isinstance(since, int):
+        cursor_value = since
+    elif isinstance(since, str) and since.isascii() and since.isdigit():
+        cursor_value = int(since)
+    else:
+        raise InvalidCursorError("event cursor must be a non-negative integer")
+    if cursor_value < 0:
+        raise InvalidCursorError("event cursor must be a non-negative integer")
+    return cursor_value
+
+
+def _task_event_payload(task: dict, summary: Optional[str]) -> dict:
+    """Build the normalized public payload for one task event."""
+    payload = {
+        "task_id": task["id"],
+        "state": task["state"],
+        "version": task["version"],
+    }
+    if summary is not None:
+        payload["summary"] = summary
+    return payload
+
+
+def _insert_event(
+    connection: sqlite3.Connection,
+    *,
+    task_id: str,
+    kind: str,
+    payload: dict,
+    at: Optional[float] = None,
+) -> dict:
+    """Insert one event on an open transaction; the caller owns the commit."""
+    if not isinstance(kind, str) or not kind:
+        raise ValueError("event kind must be a non-empty string")
+    if not isinstance(payload, dict):
+        raise ValueError("event payload must be a mapping")
+    cursor = connection.execute(
+        """
+        INSERT INTO task_events (task_id, at, kind, payload_json)
+        VALUES (?, ?, ?, ?)
+        """,
+        (task_id, time.time() if at is None else at, kind, json.dumps(payload)),
+    )
+    return dict(
+        connection.execute(
+            "SELECT * FROM task_events WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
     )
 
 
@@ -373,8 +435,16 @@ class Registry:
         task_id: Optional[str] = None,
         dedupe_key: Optional[str] = None,
         resource_key: Optional[str] = None,
+        event_kind: Optional[str] = None,
+        event_summary: Optional[str] = None,
     ) -> dict:
-        """Atomically deduplicate and reserve a resource, or queue the task."""
+        """Atomically deduplicate and reserve a resource, or queue the task.
+
+        When ``event_kind`` is given, the event row is inserted in the same
+        transaction, so a task can never exist without its creation event and a
+        refused create leaves no event behind. A dedupe hit returns the existing
+        task and creates nothing, so it emits no event.
+        """
         identifier = task_id or uuid4().hex
         now = time.time()
         connection = self._connect()
@@ -449,6 +519,14 @@ class Registry:
             row = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (identifier,)
             ).fetchone()
+            if event_kind is not None:
+                _insert_event(
+                    connection,
+                    task_id=row["id"],
+                    kind=event_kind,
+                    payload=_task_event_payload(dict(row), event_summary),
+                    at=now,
+                )
             connection.execute("COMMIT")
             return dict(row)
         except sqlite3.IntegrityError as error:
@@ -546,8 +624,15 @@ class Registry:
         *,
         expected_version: int,
         evidence: Optional[Evidence] = None,
+        event_kind: Optional[str] = None,
+        event_summary: Optional[str] = None,
     ) -> dict:
-        """Validate and persist one optimistic, state-machine-checked transition."""
+        """Validate and persist one optimistic, state-machine-checked transition.
+
+        When ``event_kind`` is given, the event is inserted in the same
+        transaction as the state change. A refused transition therefore emits
+        nothing, and a failed event insert rolls the state change back.
+        """
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -642,6 +727,14 @@ class Registry:
             updated = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
+            if event_kind is not None:
+                _insert_event(
+                    connection,
+                    task_id=task_id,
+                    kind=event_kind,
+                    payload=_task_event_payload(dict(updated), event_summary),
+                    at=now,
+                )
             connection.execute("COMMIT")
             return dict(updated)
         except sqlite3.IntegrityError as error:
@@ -679,18 +772,11 @@ class Registry:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute(
-                """
-                INSERT INTO task_events (task_id, at, kind, payload_json)
-                VALUES (?, ?, ?, ?)
-                """,
-                (task_id, time.time(), kind, json.dumps(payload)),
+            row = _insert_event(
+                connection, task_id=task_id, kind=kind, payload=payload
             )
-            row = connection.execute(
-                "SELECT * FROM task_events WHERE id = ?", (cursor.lastrowid,)
-            ).fetchone()
             connection.execute("COMMIT")
-            return dict(row)
+            return row
         except sqlite3.IntegrityError as error:
             connection.execute("ROLLBACK")
             if "FOREIGN KEY constraint failed" in str(error):
@@ -706,16 +792,7 @@ class Registry:
 
     def events_since(self, since: int = 0, *, task_id: Optional[str] = None) -> list:
         """Return events strictly after the cursor in global insertion order."""
-        if isinstance(since, bool):
-            raise InvalidCursorError("event cursor must be a non-negative integer")
-        if isinstance(since, int):
-            cursor_value = since
-        elif isinstance(since, str) and since.isascii() and since.isdigit():
-            cursor_value = int(since)
-        else:
-            raise InvalidCursorError("event cursor must be a non-negative integer")
-        if cursor_value < 0:
-            raise InvalidCursorError("event cursor must be a non-negative integer")
+        cursor_value = _coerce_cursor(since)
         connection = self._connect()
         try:
             if task_id is None:
@@ -730,5 +807,74 @@ class Registry:
                     (cursor_value, task_id),
                 ).fetchall()
             return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def events_for_conversation(
+        self,
+        conversation_key: str,
+        since: int = 0,
+        *,
+        task_id: Optional[str] = None,
+    ) -> list:
+        """Return only events whose task belongs to ``conversation_key``."""
+        if not isinstance(conversation_key, str) or not conversation_key:
+            raise ValueError("conversation_key must be a non-empty string")
+        cursor_value = _coerce_cursor(since)
+        statement = (
+            "SELECT task_events.* FROM task_events "
+            "JOIN tasks ON tasks.id = task_events.task_id "
+            "WHERE tasks.conversation_key = ? AND task_events.id > ?"
+        )
+        parameters: list = [conversation_key, cursor_value]
+        if task_id is not None:
+            statement += " AND task_events.task_id = ?"
+            parameters.append(task_id)
+        statement += " ORDER BY task_events.id"
+        connection = self._connect()
+        try:
+            rows = connection.execute(statement, parameters).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def store_worker_token(self, task_id: str, token_hash: str) -> None:
+        """Store (or rotate to) the digest of a task's worker token."""
+        if not isinstance(token_hash, str) or not token_hash:
+            raise ValueError("token hash must be a non-empty string")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if exists is None:
+                raise TaskNotFoundError(task_id)
+            connection.execute(
+                """
+                INSERT INTO task_worker_tokens (task_id, token_hash, issued_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    token_hash = excluded.token_hash,
+                    issued_at = excluded.issued_at
+                """,
+                (task_id, token_hash, time.time()),
+            )
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def worker_token_hash(self, task_id: str) -> Optional[str]:
+        """Return the stored digest for a task, or ``None`` when none is issued."""
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT token_hash FROM task_worker_tokens WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            return row["token_hash"] if row is not None else None
         finally:
             connection.close()
