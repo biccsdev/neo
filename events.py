@@ -28,6 +28,7 @@ TERMINAL_EVENT_NAMES = MappingProxyType(
         TaskState.COMPLETED: "task.completed",
         TaskState.FAILED: "task.failed",
         TaskState.CANCELLED: "task.cancelled",
+        TaskState.NEEDS_APPROVAL: "task.approval_required",
     }
 )
 """States that carry their own public event name; every other state is an update."""
@@ -107,6 +108,8 @@ class TaskService:
         expected_version: int,
         evidence: Optional[Evidence] = None,
         summary: Optional[str] = None,
+        event_extra: Optional[dict] = None,
+        worker_token_digest: Optional[str] = None,
     ) -> dict:
         """Validate, persist and announce one transition.
 
@@ -120,6 +123,8 @@ class TaskService:
             evidence=evidence,
             event_kind=event_name_for(target),
             event_summary=summary,
+            event_extra=event_extra,
+            worker_token_digest=worker_token_digest,
         )
 
     def get_task(self, task_id: str) -> Optional[dict]:

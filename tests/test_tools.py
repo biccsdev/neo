@@ -92,9 +92,13 @@ class WorkerTokenTestCase(unittest.TestCase):
     def test_an_existing_database_gains_the_token_table_on_migrate(self) -> None:
         with sqlite3.connect(self.db_path) as connection:
             connection.execute("DROP TABLE task_worker_tokens")
+            connection.execute("PRAGMA user_version = 2")
 
         Registry(path=self.db_path)
 
+        with sqlite3.connect(self.db_path) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(version, 3)
         token = self.tokens.issue(self.task["id"])
         self.assertEqual(len(self.token_rows()), 1)
         self.assertTrue(self.tokens.verify(self.task["id"], token))
@@ -161,6 +165,23 @@ class WorkerTokenTestCase(unittest.TestCase):
         self.assertTrue(self.tokens.verify(self.task["id"], second))
         self.assertEqual(len(self.token_rows()), 1)
 
+    def test_rotation_during_an_update_revokes_that_transition(self) -> None:
+        token = self.tokens.issue(self.task["id"])
+        original = self.registry.transition_task
+
+        def rotate_then_transition(*args, **kwargs):
+            self.tokens.issue(self.task["id"])
+            return original(*args, **kwargs)
+
+        self.registry.transition_task = rotate_then_transition
+        with self.assertRaises(InvalidWorkerTokenError):
+            self.tools.worker_task_update(
+                self.task["id"], token, "running", self.task["version"]
+            )
+
+        self.assertEqual(self.registry.get_task(self.task["id"]), self.task)
+        self.assertEqual(len(self.task_events(self.task["id"])), 1)
+
     # -- verification ----------------------------------------------------
 
     def test_verify_accepts_the_issued_token(self) -> None:
@@ -194,6 +215,23 @@ class WorkerTokenTestCase(unittest.TestCase):
         self.assertEqual(len(recorded), 2)
 
     # -- worker_task_update ----------------------------------------------
+
+    def test_public_update_tool_reports_progress_and_detail(self) -> None:
+        token = self.tokens.issue(self.task["id"])
+
+        running = self.tools.neo_task_update(
+            self.task["id"],
+            token,
+            state="running",
+            expected_version=self.task["version"],
+            progress=25,
+            detail="One quarter complete",
+        )
+
+        self.assertEqual(running["state"], "running")
+        payload = self.task_events(self.task["id"])[-1]["payload"]
+        self.assertEqual(payload["progress"], 25)
+        self.assertEqual(payload["detail"], "One quarter complete")
 
     def test_worker_update_transitions_and_emits_one_event(self) -> None:
         token = self.tokens.issue(self.task["id"])

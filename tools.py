@@ -2,8 +2,8 @@
 
 A worker process holds ``NEO_TASK_ID`` and a random ``NEO_TASK_TOKEN``. The
 plugin stores only a SHA-256 digest of that token, so a database read never
-yields a usable credential. Every worker call verifies the token before it
-reaches the task service, and a rejected token changes nothing.
+yields a usable credential. Every worker transition verifies the digest inside
+the same transaction as its state change, and a rejected token changes nothing.
 
 This module deliberately knows nothing about process management, supervisors,
 previews or artifacts; it is only the authorization seam and the update call.
@@ -17,7 +17,7 @@ import secrets
 from typing import Optional, Union
 
 from events import TaskService
-from registry import Registry
+from registry import InvalidWorkerTokenError, Registry
 from state_machine import Evidence, TaskState
 
 TOKEN_BYTES = 32
@@ -25,14 +25,6 @@ TOKEN_BYTES = 32
 
 class WorkerToolError(RuntimeError):
     """Base class for a refused worker call."""
-
-
-class InvalidWorkerTokenError(WorkerToolError):
-    """The presented worker token is missing, wrong, or not issued for this task.
-
-    One error type for every failure keeps the boundary from confirming whether
-    a task exists or whether a token was ever issued.
-    """
 
 
 def _digest(token: str) -> str:
@@ -74,6 +66,41 @@ class WorkerTaskTools:
         self._service = service
         self._tokens = tokens
 
+    def neo_task_update(
+        self,
+        task_id: str,
+        token: Optional[str],
+        state: Union[TaskState, str],
+        expected_version: int,
+        progress: Optional[float] = None,
+        detail: Optional[str] = None,
+        summary: Optional[str] = None,
+        evidence: Optional[Evidence] = None,
+    ) -> dict:
+        """Apply one authenticated worker transition and optional progress event.
+
+        The token digest is checked inside the state-change transaction. A token
+        rotated before or during this call therefore cannot commit stale work.
+        """
+        if not isinstance(token, str) or not token:
+            raise InvalidWorkerTokenError(
+                "worker token rejected for task %s" % task_id
+            )
+        event_extra = {}
+        if progress is not None:
+            event_extra["progress"] = progress
+        if detail is not None:
+            event_extra["detail"] = detail
+        return self._service.transition(
+            task_id,
+            state,
+            expected_version=expected_version,
+            summary=summary,
+            evidence=evidence,
+            event_extra=event_extra or None,
+            worker_token_digest=_digest(token),
+        )
+
     def worker_task_update(
         self,
         task_id: str,
@@ -83,18 +110,11 @@ class WorkerTaskTools:
         summary: Optional[str] = None,
         evidence: Optional[Evidence] = None,
     ) -> dict:
-        """Verify the worker's token, then apply exactly one transition.
-
-        The token is checked before the service is touched, so a wrong or
-        missing token cannot advance the task or leave an event behind.
-        """
-        if not self._tokens.verify(task_id, token):
-            raise InvalidWorkerTokenError(
-                "worker token rejected for task %s" % task_id
-            )
-        return self._service.transition(
+        """Compatibility wrapper for the original internal worker update name."""
+        return self.neo_task_update(
             task_id,
-            target,
+            token,
+            state=target,
             expected_version=expected_version,
             summary=summary,
             evidence=evidence,

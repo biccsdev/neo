@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import hmac
 from pathlib import Path
 import time
 from typing import Callable, Optional, Union
@@ -75,6 +76,10 @@ class TaskNotFoundError(RegistryError):
         self.task_id = task_id
 
 
+class InvalidWorkerTokenError(RegistryError):
+    """A worker credential is absent, stale, or does not match the task."""
+
+
 ACTIVE_STATES = (
     "starting",
     "running",
@@ -85,7 +90,7 @@ ACTIVE_STATES = (
     "unknown",
 )
 _ACTIVE_SQL = ", ".join("'%s'" % state for state in ACTIVE_STATES)
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 _SCHEMA = (
@@ -300,7 +305,9 @@ def _coerce_cursor(since: object) -> int:
     return cursor_value
 
 
-def _task_event_payload(task: dict, summary: Optional[str]) -> dict:
+def _task_event_payload(
+    task: dict, summary: Optional[str], extra: Optional[dict] = None
+) -> dict:
     """Build the normalized public payload for one task event."""
     payload = {
         "task_id": task["id"],
@@ -309,6 +316,10 @@ def _task_event_payload(task: dict, summary: Optional[str]) -> dict:
     }
     if summary is not None:
         payload["summary"] = summary
+    if extra:
+        if set(extra).intersection(payload):
+            raise ValueError("event extra fields cannot replace normalized fields")
+        payload.update(extra)
     return payload
 
 
@@ -445,6 +456,8 @@ class Registry:
         refused create leaves no event behind. A dedupe hit returns the existing
         task and creates nothing, so it emits no event.
         """
+        if not isinstance(conversation_key, str) or not conversation_key.strip():
+            raise ValueError("conversation_key must be a non-empty string")
         identifier = task_id or uuid4().hex
         now = time.time()
         connection = self._connect()
@@ -563,7 +576,6 @@ class Registry:
     ) -> dict:
         allowed = {
             "parent_id",
-            "conversation_key",
             "kind",
             "intent",
             "capability_id",
@@ -626,6 +638,8 @@ class Registry:
         evidence: Optional[Evidence] = None,
         event_kind: Optional[str] = None,
         event_summary: Optional[str] = None,
+        event_extra: Optional[dict] = None,
+        worker_token_digest: Optional[str] = None,
     ) -> dict:
         """Validate and persist one optimistic, state-machine-checked transition.
 
@@ -640,9 +654,24 @@ class Registry:
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
             if row is None:
+                if worker_token_digest is not None:
+                    raise InvalidWorkerTokenError(
+                        "worker token rejected for task %s" % task_id
+                    )
                 raise KeyError(task_id)
             if row["version"] != expected_version:
                 raise VersionConflictError(task_id, expected_version, row["version"])
+            if worker_token_digest is not None:
+                token_row = connection.execute(
+                    "SELECT token_hash FROM task_worker_tokens WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if token_row is None or not hmac.compare_digest(
+                    token_row["token_hash"], worker_token_digest
+                ):
+                    raise InvalidWorkerTokenError(
+                        "worker token rejected for task %s" % task_id
+                    )
 
             target_state = _coerce_target(target)
             if row["state"] == "queued" and target_state == TaskState.STARTING:
@@ -732,7 +761,9 @@ class Registry:
                     connection,
                     task_id=task_id,
                     kind=event_kind,
-                    payload=_task_event_payload(dict(updated), event_summary),
+                    payload=_task_event_payload(
+                        dict(updated), event_summary, event_extra
+                    ),
                     at=now,
                 )
             connection.execute("COMMIT")

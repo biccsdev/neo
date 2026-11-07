@@ -183,6 +183,19 @@ class TaskServiceTestCase(unittest.TestCase):
         )
         self.assertEqual(running["version"], task["version"] + 1)
 
+    def test_approval_state_uses_its_public_event_name(self) -> None:
+        task = self.create()
+        running = self.service.transition(
+            task["id"], "running", expected_version=task["version"]
+        )
+        self.service.transition(
+            running["id"], "needs_approval", expected_version=running["version"]
+        )
+
+        self.assertEqual(
+            self.task_events(task["id"])[-1]["kind"], "task.approval_required"
+        )
+
     def test_invalid_transition_emits_nothing(self) -> None:
         task = self.create()
 
@@ -286,6 +299,28 @@ class TaskServiceTestCase(unittest.TestCase):
 
     # -- conversation scoping -------------------------------------------
 
+    def test_conversation_key_is_required_on_create(self) -> None:
+        for key in ("", None):
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    self.service.create_task(
+                        conversation_key=key, kind="coding", intent="invalid"
+                    )
+        self.assertEqual(self.registry.list_tasks(), [])
+
+    def test_conversation_binding_cannot_be_changed(self) -> None:
+        task = self.create(conversation_key="alice", summary="private")
+
+        with self.assertRaises(ValueError):
+            self.registry.update_task(
+                task["id"],
+                expected_version=task["version"],
+                conversation_key="bob",
+            )
+
+        self.assertEqual(len(self.service.events_since("alice")), 1)
+        self.assertEqual(self.service.events_since("bob"), [])
+
     def test_events_are_scoped_to_the_conversation(self) -> None:
         mine = self.create(conversation_key="conversation-one")
         theirs = self.create(conversation_key="conversation-two")
@@ -337,12 +372,20 @@ class TaskServiceTestCase(unittest.TestCase):
 
 
 class EventNameTests(unittest.TestCase):
-    def test_only_terminal_states_get_their_own_name(self) -> None:
+    def test_non_terminal_states_except_approval_use_updated(self) -> None:
         self.assertEqual(event_name_for("completed"), "task.completed")
         self.assertEqual(event_name_for(TaskState.FAILED), "task.failed")
         self.assertEqual(event_name_for("cancelled"), "task.cancelled")
+        self.assertEqual(
+            event_name_for("needs_approval"), "task.approval_required"
+        )
         for state in TaskState:
-            if state in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED}:
+            if state in {
+                TaskState.COMPLETED,
+                TaskState.FAILED,
+                TaskState.CANCELLED,
+                TaskState.NEEDS_APPROVAL,
+            }:
                 continue
             with self.subTest(state=state):
                 self.assertEqual(event_name_for(state), "task.updated")
