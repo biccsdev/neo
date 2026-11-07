@@ -1,0 +1,13 @@
+{
+  "name": "neo",
+  "label": "NEO",
+  "description": "Mission control for NEO's durable coding, Blender and browser tasks: queue, preview, approve and retry.",
+  "icon": "Command",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/neo",
+    "position": "end"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
