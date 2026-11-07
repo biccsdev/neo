@@ -13,7 +13,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from registry import Registry, VersionConflictError  # noqa: E402
+from registry import (  # noqa: E402
+    ActiveTaskError,
+    CapacityExceededError,
+    InvalidCursorError,
+    Registry,
+    ResourceBusyError,
+    VersionConflictError,
+)
 from state_machine import (  # noqa: E402
     CompletionEvidence,
     IncompleteEvidenceError,
@@ -32,7 +39,10 @@ class RegistryTestCase(unittest.TestCase):
 
     def test_schema_migrates_idempotently(self) -> None:
         self.registry.migrate()
-        reopened = Registry(path=self.db_path, max_parallel=2)
+        task = self.registry.create_task(
+            conversation_key="conversation", kind="coding", intent="survives"
+        )
+        reopened = Registry(path=self.db_path)
         reopened.migrate()
 
         with sqlite3.connect(self.db_path) as connection:
@@ -47,8 +57,30 @@ class RegistryTestCase(unittest.TestCase):
                     tables
                 )
             )
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
             self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            indexes = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                )
+            }
+            triggers = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )
+            }
+            self.assertIn("tasks_active_dedupe_v2", indexes)
+            self.assertIn("task_events_task_cursor", indexes)
+            self.assertIn("tasks_max_parallel_insert", triggers)
+            self.assertIn("tasks_max_parallel_update", triggers)
+        self.assertEqual(reopened.get_task(task["id"]), task)
+
+    def test_reopening_without_an_override_preserves_the_parallel_limit(self) -> None:
+        Registry(path=self.db_path, max_parallel=1)
+        reopened = Registry(path=self.db_path)
+        self.assertEqual(reopened.max_parallel, 1)
 
     def test_task_crud_is_consistent_across_two_threads(self) -> None:
         errors = []
@@ -89,6 +121,16 @@ class RegistryTestCase(unittest.TestCase):
         tasks = self.registry.list_tasks()
         self.assertEqual(len(tasks), 8)
         self.assertTrue(all(task["version"] == 2 for task in tasks))
+        doomed = self.registry.get_task(created_ids[0])
+        doomed = self.registry.transition_task(
+            doomed["id"], "running", expected_version=doomed["version"]
+        )
+        doomed = self.registry.transition_task(
+            doomed["id"], "cancelling", expected_version=doomed["version"]
+        )
+        self.registry.transition_task(
+            doomed["id"], "cancelled", expected_version=doomed["version"]
+        )
         self.assertTrue(self.registry.delete_task(created_ids[0]))
         self.assertIsNone(self.registry.get_task(created_ids[0]))
         self.assertFalse(self.registry.delete_task(created_ids[0]))
@@ -239,6 +281,158 @@ class RegistryTestCase(unittest.TestCase):
         )
         self.assertEqual(completed["state"], "completed")
         self.assertIsNotNone(completed["finished_at"])
+
+    def test_max_parallel_is_enforced_when_a_queued_task_starts(self) -> None:
+        first = self.registry.create_task(
+            conversation_key="conversation", kind="coding", intent="one"
+        )
+        self.registry.create_task(
+            conversation_key="conversation", kind="coding", intent="two"
+        )
+        queued = self.registry.create_task(
+            conversation_key="conversation", kind="coding", intent="three"
+        )
+
+        with self.assertRaises(CapacityExceededError):
+            self.registry.transition_task(
+                queued["id"], "starting", expected_version=queued["version"]
+            )
+
+        self.assertEqual(self.registry.get_task(queued["id"])["state"], "queued")
+        self.assertEqual(self.registry.get_task(first["id"])["state"], "starting")
+
+    def test_resource_conflict_is_a_domain_error_on_transition(self) -> None:
+        holder = self.registry.create_task(
+            conversation_key="conversation",
+            kind="blender",
+            intent="holder",
+            resource_key="blender:9876",
+        )
+        waiter = self.registry.create_task(
+            conversation_key="conversation",
+            kind="blender",
+            intent="waiter",
+            resource_key="blender:9876",
+        )
+
+        with self.assertRaises(ResourceBusyError):
+            self.registry.transition_task(
+                waiter["id"], "starting", expected_version=waiter["version"]
+            )
+
+        self.assertEqual(self.registry.get_task(holder["id"])["state"], "starting")
+        self.assertEqual(self.registry.get_task(waiter["id"])["state"], "queued")
+
+    def test_update_task_translates_resource_conflict(self) -> None:
+        self.registry.create_task(
+            conversation_key="conversation",
+            kind="blender",
+            intent="holder",
+            resource_key="blender:9876",
+        )
+        other = self.registry.create_task(
+            conversation_key="conversation", kind="browser", intent="other"
+        )
+
+        with self.assertRaises(ResourceBusyError):
+            self.registry.update_task(
+                other["id"],
+                expected_version=other["version"],
+                resource_key="blender:9876",
+            )
+        self.assertIsNone(self.registry.get_task(other["id"])["resource_key"])
+
+    def test_active_task_cannot_be_deleted(self) -> None:
+        task = self.registry.create_task(
+            conversation_key="conversation", kind="coding", intent="one"
+        )
+
+        with self.assertRaises(ActiveTaskError):
+            self.registry.delete_task(task["id"])
+
+        self.assertEqual(self.registry.get_task(task["id"]), task)
+
+    def test_queued_cancellation_does_not_claim_a_start_time(self) -> None:
+        self.registry.create_task(
+            conversation_key="conversation", kind="coding", intent="one"
+        )
+        self.registry.create_task(
+            conversation_key="conversation", kind="coding", intent="two"
+        )
+        queued = self.registry.create_task(
+            conversation_key="conversation", kind="coding", intent="three"
+        )
+
+        cancelled = self.registry.transition_task(
+            queued["id"], "cancelled", expected_version=queued["version"]
+        )
+
+        self.assertIsNone(cancelled["started_at"])
+        self.assertIsNotNone(cancelled["finished_at"])
+
+    def test_completion_evidence_is_audited_on_the_task(self) -> None:
+        task = self.registry.create_task(
+            conversation_key="conversation", kind="coding", intent="one"
+        )
+        task = self.registry.update_task(
+            task["id"],
+            expected_version=task["version"],
+            expected_json='["result.txt"]',
+        )
+        task = self.registry.transition_task(
+            task["id"], "running", expected_version=task["version"]
+        )
+
+        with self.assertRaises(IncompleteEvidenceError):
+            self.registry.transition_task(
+                task["id"],
+                "completed",
+                expected_version=task["version"],
+                evidence=CompletionEvidence(
+                    executor_confirmed=True,
+                    verified_artifacts=("different.txt",),
+                ),
+            )
+
+        completed = self.registry.transition_task(
+            task["id"],
+            "completed",
+            expected_version=task["version"],
+            evidence=CompletionEvidence(
+                executor_confirmed=True,
+                verified_artifacts=("result.txt",),
+            ),
+        )
+        self.assertEqual(completed["expected_json"], '["result.txt"]')
+        self.assertEqual(completed["artifacts_json"], '["result.txt"]')
+
+    def test_dedupe_key_is_released_after_terminal_state(self) -> None:
+        first = self.registry.create_task(
+            conversation_key="conversation",
+            kind="coding",
+            intent="same request",
+            dedupe_key="request-fingerprint",
+        )
+        running = self.registry.transition_task(
+            first["id"], "running", expected_version=first["version"]
+        )
+        self.registry.transition_task(
+            running["id"], "failed", expected_version=running["version"]
+        )
+
+        second = self.registry.create_task(
+            conversation_key="conversation",
+            kind="coding",
+            intent="same request",
+            dedupe_key="request-fingerprint",
+        )
+        self.assertNotEqual(first["id"], second["id"])
+
+    def test_invalid_event_cursor_is_rejected(self) -> None:
+        with self.assertRaises(InvalidCursorError):
+            self.registry.events_since("not-a-number")
+        with self.assertRaises(InvalidCursorError):
+            self.registry.events_since(-1)
 
     def test_max_parallel_is_enforced_by_database_at_insertion(self) -> None:
         first = self.registry.create_task(

@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from state_machine import (
     TERMINAL_STATES,
+    CompletionEvidence,
     Evidence,
     TaskState,
     transition as validate_transition,
@@ -30,6 +31,52 @@ class VersionConflictError(RuntimeError):
         self.task_id = task_id
         self.expected_version = expected_version
         self.actual_version = actual_version
+
+
+class RegistryError(RuntimeError):
+    """Base class for a refused registry operation."""
+
+
+class CapacityExceededError(RegistryError):
+    """Starting this task would exceed the configured parallel limit."""
+
+
+class ResourceBusyError(RegistryError):
+    """The requested exclusive resource is already held by an active task."""
+
+
+class ActiveTaskError(RegistryError):
+    """An active task cannot be deleted out from under its worker."""
+
+    def __init__(self, task_id: str, state: str) -> None:
+        super().__init__("task %s is %s and cannot be deleted" % (task_id, state))
+        self.task_id = task_id
+        self.state = state
+
+
+class InvalidCursorError(ValueError):
+    """An event cursor was not a non-negative integer."""
+
+
+class SchemaVersionError(RegistryError):
+    """The database was written by a newer registry schema."""
+
+
+class DuplicateTaskError(RegistryError):
+    """Another active task already owns this conversation dedupe key."""
+
+
+ACTIVE_STATES = (
+    "starting",
+    "running",
+    "waiting",
+    "needs_approval",
+    "needs_input",
+    "cancelling",
+    "unknown",
+)
+_ACTIVE_SQL = ", ".join("'%s'" % state for state in ACTIVE_STATES)
+_SCHEMA_VERSION = 2
 
 
 _SCHEMA = (
@@ -63,10 +110,7 @@ _SCHEMA = (
     )
     """,
     """
-    DROP INDEX IF EXISTS tasks_active_dedupe
-    """,
-    """
-    CREATE UNIQUE INDEX tasks_active_dedupe
+    CREATE UNIQUE INDEX IF NOT EXISTS tasks_active_dedupe_v2
     ON tasks(conversation_key, dedupe_key)
     WHERE dedupe_key IS NOT NULL
       AND state IN (
@@ -104,8 +148,32 @@ _SCHEMA = (
                 'starting', 'running', 'waiting', 'needs_approval',
                 'needs_input', 'cancelling', 'unknown'
             )
-        ) >= (
-            SELECT value FROM registry_settings WHERE key = 'max_parallel'
+        ) >= COALESCE(
+            (SELECT value FROM registry_settings WHERE key = 'max_parallel'), 4
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS tasks_max_parallel_update
+    BEFORE UPDATE OF state ON tasks
+    WHEN NEW.state IN (
+        'starting', 'running', 'waiting', 'needs_approval',
+        'needs_input', 'cancelling', 'unknown'
+    )
+    AND OLD.state NOT IN (
+        'starting', 'running', 'waiting', 'needs_approval',
+        'needs_input', 'cancelling', 'unknown'
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'max parallel tasks exceeded')
+        WHERE (
+            SELECT COUNT(*) FROM tasks
+            WHERE state IN (
+                'starting', 'running', 'waiting', 'needs_approval',
+                'needs_input', 'cancelling', 'unknown'
+            )
+        ) >= COALESCE(
+            (SELECT value FROM registry_settings WHERE key = 'max_parallel'), 4
         );
     END
     """,
@@ -119,6 +187,10 @@ _SCHEMA = (
         delivered INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
     )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS task_events_task_cursor
+    ON task_events(task_id, id)
     """,
     """
     CREATE TABLE IF NOT EXISTS workers (
@@ -153,6 +225,29 @@ def _hermes_connection() -> sqlite3.Connection:
     return plugin_db("neo")
 
 
+def _translate_integrity_error(error: sqlite3.IntegrityError) -> RegistryError:
+    """Convert SQLite backstops into errors the task service can act on."""
+    message = str(error)
+    if "max parallel" in message:
+        return CapacityExceededError("maximum parallel task count reached")
+    if "tasks.resource_key" in message:
+        return ResourceBusyError("exclusive task resource is already in use")
+    if "tasks.conversation_key, tasks.dedupe_key" in message:
+        return DuplicateTaskError("an equivalent task is already active")
+    return RegistryError("registry integrity check failed: %s" % message)
+
+
+def _json_string_list(raw: object, field: str) -> tuple:
+    """Decode a persisted JSON string list or fail with a domain error."""
+    try:
+        value = json.loads(str(raw or "[]"))
+    except (TypeError, ValueError) as error:
+        raise RegistryError("%s is not valid JSON: %s" % (field, error)) from error
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise RegistryError("%s must be a JSON list of strings" % field)
+    return tuple(value)
+
+
 class Registry:
     """Own SQLite migrations and task persistence without sharing connections."""
 
@@ -161,13 +256,13 @@ class Registry:
         *,
         path: Optional[Union[str, Path]] = None,
         connection_factory: Optional[ConnectionFactory] = None,
-        max_parallel: int = 4,
+        max_parallel: Optional[int] = None,
     ) -> None:
         if path is not None and connection_factory is not None:
             raise ValueError("provide either path or connection_factory, not both")
-        if max_parallel < 1:
+        if max_parallel is not None and max_parallel < 1:
             raise ValueError("max_parallel must be at least one")
-        self.max_parallel = max_parallel
+        self._requested_max_parallel = max_parallel
         if connection_factory is not None:
             self._connection_factory = connection_factory
         elif path is not None:
@@ -186,6 +281,14 @@ class Registry:
         else:
             self._connection_factory = _hermes_connection
         self.migrate()
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT value FROM registry_settings WHERE key = 'max_parallel'"
+            ).fetchone()
+            self.max_parallel = int(row["value"]) if row is not None else 4
+        finally:
+            connection.close()
 
     def _connect(self) -> sqlite3.Connection:
         connection = self._connection_factory()
@@ -198,19 +301,35 @@ class Registry:
     def migrate(self) -> None:
         """Apply the current schema repeatedly without replacing existing data."""
         connection = self._connect()
+        started = False
         try:
+            current_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if current_version > _SCHEMA_VERSION:
+                raise SchemaVersionError(
+                    "registry schema %s is newer than supported version %s"
+                    % (current_version, _SCHEMA_VERSION)
+                )
             connection.execute("BEGIN IMMEDIATE")
+            started = True
+            if current_version < 2:
+                connection.execute("DROP INDEX IF EXISTS tasks_active_dedupe")
             for statement in _SCHEMA:
                 connection.execute(statement)
             connection.execute(
-                "INSERT OR REPLACE INTO registry_settings (key, value) "
-                "VALUES ('max_parallel', ?)",
-                (self.max_parallel,),
+                "INSERT OR IGNORE INTO registry_settings (key, value) "
+                "VALUES ('max_parallel', 4)"
             )
-            connection.execute("PRAGMA user_version = 1")
+            if self._requested_max_parallel is not None:
+                connection.execute(
+                    "UPDATE registry_settings SET value = ? "
+                    "WHERE key = 'max_parallel'",
+                    (self._requested_max_parallel,),
+                )
+            connection.execute("PRAGMA user_version = %d" % _SCHEMA_VERSION)
             connection.execute("COMMIT")
         except Exception:
-            connection.execute("ROLLBACK")
+            if started:
+                connection.execute("ROLLBACK")
             raise
         finally:
             connection.close()
@@ -302,6 +421,9 @@ class Registry:
             ).fetchone()
             connection.execute("COMMIT")
             return dict(row)
+        except sqlite3.IntegrityError as error:
+            connection.execute("ROLLBACK")
+            raise _translate_integrity_error(error) from error
         except Exception:
             connection.execute("ROLLBACK")
             raise
@@ -378,6 +500,9 @@ class Registry:
             ).fetchone()
             connection.execute("COMMIT")
             return dict(row)
+        except sqlite3.IntegrityError as error:
+            connection.execute("ROLLBACK")
+            raise _translate_integrity_error(error) from error
         except Exception:
             connection.execute("ROLLBACK")
             raise
@@ -404,14 +529,66 @@ class Registry:
             if row["version"] != expected_version:
                 raise VersionConflictError(task_id, expected_version, row["version"])
 
-            new_state = validate_transition(row["state"], target, evidence=evidence)
+            target_state = TaskState(target)
+            if row["state"] == "queued" and target_state == TaskState.STARTING:
+                active = connection.execute(
+                    "SELECT COUNT(*) AS count FROM tasks WHERE state IN (%s)"
+                    % _ACTIVE_SQL
+                ).fetchone()["count"]
+                limit_row = connection.execute(
+                    "SELECT value FROM registry_settings WHERE key = 'max_parallel'"
+                ).fetchone()
+                limit = int(limit_row["value"]) if limit_row is not None else 4
+                if active >= limit:
+                    raise CapacityExceededError(
+                        "cannot start task: %s active tasks, limit %s"
+                        % (active, limit)
+                    )
+                if row["resource_key"] is not None:
+                    busy = connection.execute(
+                        "SELECT 1 FROM tasks WHERE resource_key = ? "
+                        "AND state IN (%s) LIMIT 1" % _ACTIVE_SQL,
+                        (row["resource_key"],),
+                    ).fetchone()
+                    if busy is not None:
+                        raise ResourceBusyError(
+                            "resource %s is already in use" % row["resource_key"]
+                        )
+
+            expected_json = row["expected_json"]
+            artifacts_json = row["artifacts_json"]
+            checked_evidence = evidence
+            if target_state == TaskState.COMPLETED and isinstance(
+                evidence, CompletionEvidence
+            ):
+                stored_expected = _json_string_list(expected_json, "expected_json")
+                combined_expected = tuple(
+                    dict.fromkeys(
+                        (*stored_expected, *tuple(evidence.expected_artifacts))
+                    )
+                )
+                checked_evidence = CompletionEvidence(
+                    executor_confirmed=evidence.executor_confirmed,
+                    expected_artifacts=combined_expected,
+                    verified_artifacts=evidence.verified_artifacts,
+                )
+                expected_json = json.dumps(list(combined_expected))
+                artifacts_json = json.dumps(list(evidence.verified_artifacts))
+
+            new_state = validate_transition(
+                row["state"], target_state, evidence=checked_evidence
+            )
             now = time.time()
-            started_at = row["started_at"] if row["started_at"] is not None else now
+            if new_state == TaskState.STARTING and row["started_at"] is None:
+                started_at = now
+            else:
+                started_at = row["started_at"]
             finished_at = now if new_state in TERMINAL_STATES else row["finished_at"]
             cursor = connection.execute(
                 """
                 UPDATE tasks
                 SET state = ?, started_at = ?, finished_at = ?,
+                    expected_json = ?, artifacts_json = ?,
                     version = version + 1, updated_at = ?
                 WHERE id = ? AND version = ?
                 """,
@@ -419,6 +596,8 @@ class Registry:
                     new_state.value,
                     started_at,
                     finished_at,
+                    expected_json,
+                    artifacts_json,
                     now,
                     task_id,
                     expected_version,
@@ -435,6 +614,9 @@ class Registry:
             ).fetchone()
             connection.execute("COMMIT")
             return dict(updated)
+        except sqlite3.IntegrityError as error:
+            connection.execute("ROLLBACK")
+            raise _translate_integrity_error(error) from error
         except Exception:
             connection.execute("ROLLBACK")
             raise
@@ -445,9 +627,17 @@ class Registry:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            row = connection.execute(
+                "SELECT state FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                connection.execute("COMMIT")
+                return False
+            if row["state"] in ACTIVE_STATES:
+                raise ActiveTaskError(task_id, row["state"])
+            connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             connection.execute("COMMIT")
-            return cursor.rowcount == 1
+            return True
         except Exception:
             connection.execute("ROLLBACK")
             raise
@@ -479,17 +669,28 @@ class Registry:
 
     def events_since(self, since: int = 0, *, task_id: Optional[str] = None) -> list:
         """Return events strictly after the cursor in global insertion order."""
+        if isinstance(since, bool):
+            raise InvalidCursorError("event cursor must be a non-negative integer")
+        if isinstance(since, int):
+            cursor_value = since
+        elif isinstance(since, str) and since.isdigit():
+            cursor_value = int(since)
+        else:
+            raise InvalidCursorError("event cursor must be a non-negative integer")
+        if cursor_value < 0:
+            raise InvalidCursorError("event cursor must be a non-negative integer")
         connection = self._connect()
         try:
             if task_id is None:
                 rows = connection.execute(
-                    "SELECT * FROM task_events WHERE id > ? ORDER BY id", (since,)
+                    "SELECT * FROM task_events WHERE id > ? ORDER BY id",
+                    (cursor_value,),
                 ).fetchall()
             else:
                 rows = connection.execute(
                     "SELECT * FROM task_events "
                     "WHERE id > ? AND task_id = ? ORDER BY id",
-                    (since, task_id),
+                    (cursor_value, task_id),
                 ).fetchall()
             return [dict(row) for row in rows]
         finally:
