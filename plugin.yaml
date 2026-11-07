@@ -1,0 +1,20 @@
+name: neo
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: "Voice-first macOS mission control for Hermes: durable parallel coding, Blender, and browser tasks with live previews."
+author: NEO contributors
+license: MIT
+homepage: https://github.com/biccsdev/neo
+platforms:
+  - macos
+requires_hermes: ">=0.22.6"
+tags:
+  - macos
+  - orchestration
+  - codex
+  - claude
+  - blender
+  - browser
+provides_tools: []
+provides_hooks: []
