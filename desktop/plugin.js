@@ -259,6 +259,45 @@ export function taskIdFromRoute(route) {
   return null
 }
 
+/**
+ * A stable identity for one completed task version, or null when the task is
+ * not a completed version NEO could present. This is the key the proactive
+ * hook records, so one version presents once even across a page reload.
+ */
+export function completionKey(task) {
+  if (!task || typeof task !== 'object') return null
+  if (task.state !== 'completed') return null
+  const id = typeof task.id === 'string' ? task.id.trim() : ''
+  if (!id || !TASK_ID_RE.test(id)) return null
+  const version = task.version
+  if (typeof version !== 'number' || !Number.isFinite(version) || version < 0) return null
+  return `${id}:${version}`
+}
+
+/** Completed tasks whose version has not been observed yet, in list order. */
+export function newlyCompleted(tasks, seen) {
+  const known = seen instanceof Set ? seen : new Set(Array.isArray(seen) ? seen : [])
+  const rows = Array.isArray(tasks) ? tasks : []
+  const fresh = []
+  for (const task of rows) {
+    const key = completionKey(task)
+    if (!key || known.has(key)) continue
+    fresh.push(task)
+  }
+  return fresh
+}
+
+/** Interpret a persisted quiet setting without guessing at its encoding. */
+export function isQuietValue(value) {
+  if (value === true) return true
+  if (typeof value === 'number') return value === 1
+  if (typeof value === 'string') {
+    const normal = value.trim().toLowerCase()
+    return normal === '1' || normal === 'true' || normal === 'quiet' || normal === 'on'
+  }
+  return false
+}
+
 /** Read a REST failure the way the SDK reports it: `"409: {\"detail\": …}"`. */
 export function parseRestError(error) {
   const message =
@@ -382,9 +421,13 @@ const STATUS_RIGHT_AREA = (sdk.STATUSBAR_AREAS && sdk.STATUSBAR_AREAS.right) || 
 const PALETTE_AREA = sdk.PALETTE_AREA || 'palette'
 const TOOL_MEDIA_AREA = sdk.TOOL_MEDIA_RENDERER_AREA || 'transcript.toolMedia'
 
-const POLL_MS = 3000
+const PREVIEW_POLL_MS = 3000
+const POLL_MS = 5000
 const CHIP_POLL_MS = 5000
 const LOG_TAIL = 80
+const STORAGE_QUIET = 'neo.quiet'
+const STORAGE_SEEN = 'neo.presented'
+const SEEN_LIMIT = 200
 const TASK_EVENT_PREFIX = 'plugin.neo.task.'
 const CAPABILITY_EVENT = 'plugin.neo.capability.install_changed'
 
@@ -479,8 +522,78 @@ function notify(message) {
   }
 }
 
+function notifyInfo(message) {
+  if (sdk.host && typeof sdk.host.notify === 'function') {
+    sdk.host.notify({ kind: 'info', message })
+  }
+}
+
 function navigateToNeo() {
   if (sdk.host && typeof sdk.host.navigate === 'function') sdk.host.navigate('/neo')
+}
+
+/** Navigate straight to one task; the page reads `?task=` on its next look. */
+function navigateToTask(taskId) {
+  if (
+    typeof taskId !== 'string' ||
+    !TASK_ID_RE.test(taskId) ||
+    !sdk.host ||
+    typeof sdk.host.navigate !== 'function'
+  ) {
+    return
+  }
+  sdk.host.navigate(`/neo?task=${encodeURIComponent(taskId)}`)
+}
+
+/**
+ * Read one value from the host's plugin storage. Storage shapes differ across
+ * hosts, so both an async `get` and a `getItem` door are tried; absence is an
+ * honest null rather than an exception.
+ */
+async function storageRead(ctx, key) {
+  const store = ctx && ctx.storage && typeof ctx.storage === 'object' ? ctx.storage : null
+  if (!store) return null
+  try {
+    if (typeof store.get === 'function') return await store.get(key)
+    if (typeof store.getItem === 'function') return await store.getItem(key)
+  } catch (error) {
+    return null
+  }
+  return null
+}
+
+/** Write one value to plugin storage; a host without storage is not an error. */
+async function storageWrite(ctx, key, value) {
+  const store = ctx && ctx.storage && typeof ctx.storage === 'object' ? ctx.storage : null
+  if (!store) return false
+  try {
+    if (typeof store.set === 'function') {
+      await store.set(key, value)
+      return true
+    }
+    if (typeof store.setItem === 'function') {
+      await store.setItem(key, value)
+      return true
+    }
+  } catch (error) {
+    return false
+  }
+  return false
+}
+
+/** Keep a persisted seen list bounded without dropping the newest keys. */
+function trimSeen(keys) {
+  const list = Array.isArray(keys) ? keys.filter(key => typeof key === 'string' && key) : []
+  return list.slice(Math.max(0, list.length - SEEN_LIMIT))
+}
+
+/** Present one newly completed task exactly once from this surface. */
+async function presentCompletion(ctx, task) {
+  try {
+    return await ctx.rest(`/tasks/${encodeURIComponent(task.id)}/present`, { method: 'POST' })
+  } catch (error) {
+    return { presented: false, skipped: true, reason: describeRestError(error) }
+  }
 }
 
 // -- pieces ------------------------------------------------------------------
@@ -763,6 +876,10 @@ function NeoDetail({
                 alt: `Latest preview for ${task.id}`,
                 className: 'mt-1 max-h-80 w-auto max-w-full rounded border border-(--ui-stroke-tertiary) object-contain',
                 decoding: 'async',
+                key:
+                  preview && preview.rev !== null && preview.rev !== undefined
+                    ? `${task.id}:${preview.rev}`
+                    : task.id,
                 loading: 'lazy',
                 src: previewUri
               })
@@ -909,12 +1026,15 @@ function NeoPage({ ctx }) {
   const [catalog, setCatalog] = useState(null)
   const [catalogQuery, setCatalogQuery] = useState('')
   const [notice, setNotice] = useState(null)
+  const [completionNotice, setCompletionNotice] = useState(null)
   const [pending, setPending] = useState('')
+  const [quiet, setQuiet] = useState(false)
 
   const selectedIdRef = useRef(selectedId)
   const pendingRef = useRef('')
   const previewToken = useRef(0)
   const refreshRef = useRef(null)
+  const completionsSeen = useRef(null)
 
   const loadList = useCallback(async () => {
     const results = await Promise.allSettled([ctx.rest(`/tasks`), ctx.rest(`/health`)])
@@ -1004,6 +1124,23 @@ function NeoPage({ ctx }) {
     [ctx]
   )
 
+  const pollPreview = useCallback(async () => {
+    const id = selectedIdRef.current
+    if (!id) return
+    const token = previewToken.current
+    let next = null
+    try {
+      next = await ctx.rest(`/tasks/${encodeURIComponent(id)}/preview`)
+    } catch (error) {
+      next = { available: false, reason: describeRestError(error) }
+    }
+    if (previewToken.current !== token || selectedIdRef.current !== id) return
+    if (!next || typeof next !== 'object') return
+    // The data URI changes with the bytes, so a revision paints immediately
+    // and an unchanged revision leaves the mounted image alone.
+    setPreview(current => (samePreview(current, next) ? current : next))
+  }, [ctx])
+
   const refresh = useCallback(async () => {
     await loadList()
     const id = selectedIdRef.current
@@ -1011,12 +1148,39 @@ function NeoPage({ ctx }) {
   }, [loadList, loadDetail])
 
   usePolling(ctx, refresh, POLL_MS)
+  usePolling(ctx, pollPreview, PREVIEW_POLL_MS)
+
+  useEffect(() => {
+    let live = true
+    storageRead(ctx, STORAGE_QUIET).then(
+      value => {
+        if (live) setQuiet(isQuietValue(value))
+      },
+      () => {
+        if (live) setQuiet(false)
+      }
+    )
+    return () => {
+      live = false
+    }
+  }, [ctx])
+
+  const toggleQuiet = () => {
+    setQuiet(current => {
+      const next = !current
+      void storageWrite(ctx, STORAGE_QUIET, next ? '1' : '0')
+      return next
+    })
+  }
 
   useEffect(() => {
     selectedIdRef.current = selectedId
     setArtifact(null)
     setCatalog(null)
     setNotice(null)
+    // Never paint one task's preview under another task's heading, even for
+    // the moment before the new selection's preview arrives.
+    setPreview(null)
     if (selectedId) void loadDetail(selectedId)
   }, [selectedId, loadDetail])
 
@@ -1032,6 +1196,27 @@ function NeoPage({ ctx }) {
     if (selectedId && rows.some(task => task.id === selectedId)) return
     if (rows.length && rows[0].id !== selectedId) setSelectedId(rows[0].id)
   }, [tasks, selectedId])
+
+  // A completion that appears while the page is open is announced visibly and
+  // selected. The initial list is context, not news, so it primes the set.
+  useEffect(() => {
+    const rows = Array.isArray(tasks)
+      ? tasks.filter(task => task && typeof task.id === 'string')
+      : []
+    const completed = rows.filter(task => completionKey(task))
+    if (completionsSeen.current === null) {
+      completionsSeen.current = new Set(completed.map(task => completionKey(task)))
+      return
+    }
+    const fresh = newlyCompleted(rows, completionsSeen.current)
+    if (!fresh.length) return
+    for (const task of fresh) completionsSeen.current.add(completionKey(task))
+    const newest = fresh[fresh.length - 1]
+    setCompletionNotice(
+      `Task completed: ${newest.intent || newest.id}. The verified result is ready to open.`
+    )
+    if (typeof newest.id === 'string' && newest.id) setSelectedId(newest.id)
+  }, [tasks])
 
   useEffect(() => {
     refreshRef.current = () => {
@@ -1269,6 +1454,13 @@ function NeoPage({ ctx }) {
               ? jsx(Badge, { variant: 'destructive', children: `${failedCount} failed` })
               : null,
             jsx(Button, {
+              'aria-pressed': quiet,
+              onClick: toggleQuiet,
+              size: 'sm',
+              variant: quiet ? 'secondary' : 'ghost',
+              children: quiet ? 'Quiet on' : 'Quiet'
+            }),
+            jsx(Button, {
               disabled: loading,
               onClick: () => {
                 void refresh()
@@ -1287,6 +1479,14 @@ function NeoPage({ ctx }) {
         ? jsx('p', {
             className: 'mb-2 rounded border border-(--ui-stroke-tertiary) px-2 py-1 text-xs text-destructive',
             children: listError
+          })
+        : null,
+
+      completionNotice
+        ? jsx('p', {
+            className:
+              'mb-2 rounded border border-(--ui-stroke-tertiary) px-2 py-1 text-xs text-muted-foreground',
+            children: completionNotice
           })
         : null,
 
@@ -1362,7 +1562,59 @@ function NeoPage({ ctx }) {
 function NeoStatusChip({ ctx }) {
   const [summary, setSummary] = useState({ active: 0, needsYou: 0, loaded: false })
 
+  const seenRef = useRef(new Set())
+  const primedRef = useRef(false)
+  const presentingRef = useRef(new Set())
+  const quietRef = useRef(false)
+  const hydratedRef = useRef(false)
+
+  const persistSeen = useCallback(async () => {
+    await storageWrite(ctx, STORAGE_SEEN, trimSeen(Array.from(seenRef.current)))
+  }, [ctx])
+
+  /**
+   * Announce and present completions observed after the chip mounted. The
+   * first list is context, never news: priming it prevents a backlog from
+   * opening every finished result at startup. The backend ledger is the
+   * second line of defence if two surfaces see the same completion.
+   */
+  const observeCompletions = useCallback(
+    async rows => {
+      const completed = rows.filter(task => completionKey(task))
+      if (!primedRef.current) {
+        for (const task of completed) seenRef.current.add(completionKey(task))
+        primedRef.current = true
+        await persistSeen()
+        return
+      }
+      const fresh = newlyCompleted(rows, seenRef.current)
+      for (const task of fresh) {
+        const key = completionKey(task)
+        if (!key || presentingRef.current.has(key)) continue
+        presentingRef.current.add(key)
+        seenRef.current.add(key)
+        await presentCompletion(ctx, task)
+        navigateToTask(task.id)
+        if (!quietRef.current) {
+          notifyInfo(`Task completed: ${task.intent || task.id}.`)
+        }
+      }
+      if (fresh.length) await persistSeen()
+    },
+    [ctx, persistSeen]
+  )
+
   const load = useCallback(async () => {
+    quietRef.current = isQuietValue(await storageRead(ctx, STORAGE_QUIET))
+    if (!hydratedRef.current) {
+      const stored = await storageRead(ctx, STORAGE_SEEN)
+      if (Array.isArray(stored)) {
+        for (const key of stored) {
+          if (typeof key === 'string' && key) seenRef.current.add(key)
+        }
+      }
+      hydratedRef.current = true
+    }
     try {
       const body = await ctx.rest(`/tasks`)
       const rows = body && Array.isArray(body.tasks) ? body.tasks : []
@@ -1371,10 +1623,11 @@ function NeoStatusChip({ ctx }) {
         needsYou: rows.filter(task => userStateForTask(task) === 'needs-you').length,
         loaded: true
       })
+      await observeCompletions(rows)
     } catch (error) {
       setSummary({ active: 0, needsYou: 0, loaded: false })
     }
-  }, [ctx])
+  }, [ctx, observeCompletions])
 
   usePolling(ctx, load, CHIP_POLL_MS)
 

@@ -90,7 +90,7 @@ ACTIVE_STATES = (
     "unknown",
 )
 _ACTIVE_SQL = ", ".join("'%s'" % state for state in ACTIVE_STATES)
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 
 _SCHEMA = (
@@ -247,6 +247,17 @@ _SCHEMA = (
         FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS task_presentations (
+        task_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        claimed_at REAL NOT NULL,
+        presented_at REAL,
+        path TEXT NOT NULL,
+        PRIMARY KEY (task_id, version),
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    )
+    """,
 )
 
 
@@ -307,6 +318,15 @@ def _coerce_cursor(since: object) -> int:
     if cursor_value < 0:
         raise InvalidCursorError("event cursor must be a non-negative integer")
     return cursor_value
+
+
+def _presentation_key(task_id: object, version: object) -> int:
+    """Validate a task/version pair used by the presentation ledger."""
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError("presentation task id must be a non-empty string")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise ValueError("presentation version must be a non-negative integer")
+    return version
 
 
 def _task_event_payload(
@@ -826,6 +846,125 @@ class Registry:
             raise
         finally:
             connection.close()
+
+    def claim_presentation(self, task_id: str, version: int, path: str) -> bool:
+        """Claim one ``(task_id, version)`` presentation, or report it taken.
+
+        The claim is taken inside ``BEGIN IMMEDIATE`` so two processes cannot
+        both win, and it is only taken after the caller has verified the
+        artifact. A claimed row that never finishes can be released by the
+        caller, which makes a retry possible without ever opening twice.
+        """
+        version = _presentation_key(task_id, version)
+        if not isinstance(path, str) or not path:
+            raise ValueError("presentation path must be a non-empty string")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if exists is None:
+                raise TaskNotFoundError(task_id)
+            claimed = connection.execute(
+                "SELECT 1 FROM task_presentations WHERE task_id = ? AND version = ?",
+                (task_id, version),
+            ).fetchone()
+            if claimed is not None:
+                connection.execute("COMMIT")
+                return False
+            connection.execute(
+                """
+                INSERT INTO task_presentations (task_id, version, claimed_at, path)
+                VALUES (?, ?, ?, ?)
+                """,
+                (task_id, version, time.time(), path),
+            )
+            connection.execute("COMMIT")
+            return True
+        except TaskNotFoundError:
+            connection.execute("ROLLBACK")
+            raise
+        except sqlite3.IntegrityError as error:
+            connection.execute("ROLLBACK")
+            if "FOREIGN KEY constraint failed" in str(error):
+                raise TaskNotFoundError(task_id) from error
+            raise RegistryError(
+                "presentation claim failed integrity check: %s" % error
+            ) from error
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def finish_presentation(self, task_id: str, version: int) -> bool:
+        """Mark a held claim as presented; an unclaimed key is left alone."""
+        version = _presentation_key(task_id, version)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE task_presentations SET presented_at = ?
+                WHERE task_id = ? AND version = ? AND presented_at IS NULL
+                """,
+                (time.time(), task_id, version),
+            )
+            connection.execute("COMMIT")
+            return cursor.rowcount == 1
+        except sqlite3.IntegrityError as error:
+            connection.execute("ROLLBACK")
+            raise RegistryError(
+                "presentation finish failed integrity check: %s" % error
+            ) from error
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def release_presentation(self, task_id: str, version: int) -> bool:
+        """Release an unfinished claim so a failed open can be retried.
+
+        A finished presentation is never released: that is what makes a
+        successful open idempotent per task version.
+        """
+        version = _presentation_key(task_id, version)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                DELETE FROM task_presentations
+                WHERE task_id = ? AND version = ? AND presented_at IS NULL
+                """,
+                (task_id, version),
+            )
+            connection.execute("COMMIT")
+            return cursor.rowcount == 1
+        except sqlite3.IntegrityError as error:
+            connection.execute("ROLLBACK")
+            raise RegistryError(
+                "presentation release failed integrity check: %s" % error
+            ) from error
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def claim(self, task_id: str, version: int, path: str) -> bool:
+        """Ledger port alias for :meth:`claim_presentation`."""
+        return self.claim_presentation(task_id, version, path)
+
+    def finish(self, task_id: str, version: int) -> bool:
+        """Ledger port alias for :meth:`finish_presentation`."""
+        return self.finish_presentation(task_id, version)
+
+    def release(self, task_id: str, version: int) -> bool:
+        """Ledger port alias for :meth:`release_presentation`."""
+        return self.release_presentation(task_id, version)
 
     def append_event(self, task_id: str, kind: str, payload: dict) -> dict:
         """Durably append one task event in its own transaction."""

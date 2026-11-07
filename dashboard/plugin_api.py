@@ -74,8 +74,14 @@ from capabilities import (  # noqa: E402
     validate_capability,
 )
 from events import TaskService  # noqa: E402
+from presentation import (  # noqa: E402
+    MacOSOpener,
+    PresentationResult,
+    PresentationService,
+    TaskPresenter,
+)
 from previews import PreviewService  # noqa: E402
-from registry import Registry  # noqa: E402
+from registry import Registry, TaskNotFoundError  # noqa: E402
 from state_machine import TERMINAL_STATES, TaskState  # noqa: E402
 
 PLUGIN_VERSION = "0.1.0"
@@ -205,6 +211,12 @@ class EnableBody(BaseModel):
     """A capability NEO should hand to Hermes to enable."""
 
     name: str = Field(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class PresentBody(BaseModel):
+    """Optional conversation binding for one presentation request."""
+
+    conversation_key: Optional[str] = Field(None, min_length=1, max_length=128)
 
 
 # -- small helpers ------------------------------------------------------------
@@ -691,6 +703,43 @@ def build_router(services_factory: Callable[[], Any]) -> APIRouter:
             ) from None
         return _public_task(final)
 
+    @router.post("/tasks/{task_id}/present")
+    async def present_task(
+        task_id: str, body: Optional[PresentBody] = None
+    ) -> dict:
+        """Present a completed, verified task once; repeats are clean skips.
+
+        The presenter reads the task itself, so this route never reaches for
+        another task's state. An optional conversation key binds the call to
+        the conversation that owns the task.
+        """
+        services = _services(services_factory)
+        _check_task_id(task_id)
+        presenter = getattr(services, "presenter", None)
+        if presenter is None or not callable(getattr(presenter, "present_task", None)):
+            raise HTTPException(status_code=409, detail="presentation is not available")
+        conversation_key = None if body is None else body.conversation_key
+        try:
+            outcome = await run_in_threadpool(
+                presenter.present_task, task_id, conversation_key
+            )
+        except TaskNotFoundError:
+            raise HTTPException(status_code=404, detail=_NOT_FOUND) from None
+        except Exception:
+            raise HTTPException(
+                status_code=409, detail="the result could not be presented"
+            ) from None
+        if isinstance(outcome, PresentationResult):
+            payload = outcome.as_dict()
+        elif isinstance(outcome, dict):
+            payload = dict(outcome)
+        else:
+            raise HTTPException(
+                status_code=409, detail="the result could not be presented"
+            )
+        payload.setdefault("skipped", not bool(payload.get("presented")))
+        return payload
+
     # -- capabilities ----------------------------------------------------
 
     @router.get("/capabilities")
@@ -845,6 +894,10 @@ def _default_services() -> Any:
         registry,
         preview_root=os.environ.get("NEO_PREVIEW_DIR") or str(home / "previews"),
     )
+    presenter = TaskPresenter(
+        registry,
+        PresentationService(MacOSOpener(), ledger=registry),
+    )
     supervisor = None
     try:
         from tools import WorkerTokenStore
@@ -867,6 +920,7 @@ def _default_services() -> Any:
         registry=registry,
         task_service=service,
         preview_service=preview,
+        presenter=presenter,
         supervisor=supervisor,
         retry=_default_retry(service),
         capabilities=discovery,

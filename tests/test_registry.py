@@ -55,11 +55,15 @@ class RegistryTestCase(unittest.TestCase):
                 )
             }
             self.assertTrue(
-                {"tasks", "task_events", "workers", "capability_consents"}.issubset(
-                    tables
-                )
+                {
+                    "tasks",
+                    "task_events",
+                    "workers",
+                    "capability_consents",
+                    "task_presentations",
+                }.issubset(tables)
             )
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
             self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             indexes = {
                 row[0]

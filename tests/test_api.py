@@ -52,7 +52,9 @@ from capabilities import (  # noqa: E402
     CapabilityDiscovery,
     InMemoryConsentStore,
 )
+from artifacts import completion_evidence  # noqa: E402
 from events import TaskService  # noqa: E402
+from presentation import PresentationService, TaskPresenter  # noqa: E402
 from previews import PreviewService  # noqa: E402
 from registry import Registry  # noqa: E402
 
@@ -270,6 +272,7 @@ class HealthAndManifestTests(APITestCase):
             ("GET", "/tasks/{task_id}/log"),
             ("GET", "/tasks/{task_id}/capabilities"),
             ("POST", "/tasks/{task_id}/approve"),
+            ("POST", "/tasks/{task_id}/present"),
             ("GET", "/capabilities"),
             ("POST", "/capabilities/consent"),
             ("POST", "/capabilities/install"),
@@ -796,6 +799,116 @@ class CapabilityRouteTests(APITestCase):
             client.post(PREFIX + "/capabilities/install", json=self.capability_body()).status_code,
             409,
         )
+
+
+class PresentRouteTests(APITestCase):
+    """POST /tasks/{id}/present is idempotent, conversation-bound and threaded."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.opened = []
+        self.presentation = PresentationService(
+            self.opened.append, ledger=self.registry
+        )
+        self.presenter = TaskPresenter(self.registry, self.presentation)
+        self.present_root = self.workdir("present")
+        (self.present_root / "report.md").write_text("# done", encoding="utf-8")
+
+    def completed(self, conversation_key: str = "conv-a") -> dict:
+        task = self.create(conversation_key=conversation_key, workdir=self.present_root)
+        running = self.drive(task, "starting", "running")
+        evidence = completion_evidence(self.present_root, ["report.md"])
+        return self.service.transition(
+            running["id"],
+            "completed",
+            expected_version=running["version"],
+            evidence=evidence,
+        )
+
+    def client_with_presenter(self, presenter=None):
+        presenter = presenter or self.presenter
+        return self.client(self.services(presenter=presenter))
+
+    def present(self, client, task_id: str, payload=None):
+        url = PREFIX + "/tasks/" + task_id + "/present"
+        if payload is None:
+            return client.post(url)
+        return client.post(url, json=payload)
+
+    def test_present_is_idempotent_and_opens_once(self) -> None:
+        task = self.completed()
+        client = self.client_with_presenter()
+        first = self.present(client, task["id"])
+        second = self.present(client, task["id"])
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        body = self.assert_json(first)
+        self.assertTrue(body["presented"])
+        self.assertFalse(body["skipped"])
+        again = self.assert_json(second)
+        self.assertFalse(again["presented"])
+        self.assertTrue(again["skipped"])
+        self.assertIn("already presented", again["reason"])
+        self.assertEqual(len(self.opened), 1)
+        self.assertEqual(self.opened[0], str((self.present_root / "report.md").resolve()))
+
+    def test_present_binds_the_task_to_a_conversation(self) -> None:
+        task = self.completed(conversation_key="conv-a")
+        client = self.client_with_presenter()
+        refused = self.present(client, task["id"], {"conversation_key": "conv-b"})
+        self.assertEqual(refused.status_code, 404)
+        self.assertEqual(self.opened, [])
+        allowed = self.present(client, task["id"], {"conversation_key": "conv-a"})
+        self.assertEqual(allowed.status_code, 200)
+        self.assertTrue(self.assert_json(allowed)["presented"])
+
+    def test_present_unknown_and_malformed_ids_are_not_found(self) -> None:
+        client = self.client_with_presenter()
+        for task_id in ("does-not-exist", "..", "with space", "a" * 65):
+            with self.subTest(task_id=task_id):
+                response = client.post(PREFIX + "/tasks/" + task_id + "/present")
+                self.assertEqual(response.status_code, 404)
+                self.assertNotIn(str(self.root), response.text)
+        self.assertEqual(self.opened, [])
+
+    def test_present_incomplete_task_is_skipped_not_opened(self) -> None:
+        task = self.create(workdir=self.present_root)
+        response = self.present(self.client_with_presenter(), task["id"])
+        self.assertEqual(response.status_code, 200)
+        body = self.assert_json(response)
+        self.assertFalse(body["presented"])
+        self.assertTrue(body["skipped"])
+        self.assertEqual(self.opened, [])
+
+    def test_present_refuses_a_missing_presenter(self) -> None:
+        task = self.completed()
+        response = self.present(self.client(), task["id"])
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.opened, [])
+
+    def test_present_callback_runs_off_the_event_loop(self) -> None:
+        observations = []
+
+        class ProbePresenter:
+            def present_task(self, task_id, conversation_key=None):
+                try:
+                    asyncio.get_running_loop()
+                    observations.append(True)
+                except RuntimeError:
+                    observations.append(False)
+                return {
+                    "task_id": task_id,
+                    "version": 1,
+                    "presented": False,
+                    "skipped": True,
+                    "path": None,
+                    "reason": "probe",
+                }
+
+        task = self.completed()
+        response = self.present(self.client_with_presenter(ProbePresenter()), task["id"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(observations, [False])
 
 
 class ThreadingTests(APITestCase):

@@ -225,8 +225,8 @@ class DesktopPluginContractTest(unittest.TestCase):
         )
         self.assertEqual(
             len(re.findall(r"^\s+usePolling\(ctx,", self.code, re.MULTILINE)),
-            2,
-            "page and chip each poll once",
+            3,
+            "page list, selected preview and chip each poll once",
         )
         self.assertIn("onEvent('*'", self.code)
         self.assertIn("plugin.neo.task.", self.code)
@@ -235,7 +235,7 @@ class DesktopPluginContractTest(unittest.TestCase):
             r"return\s*\(\)\s*=>\s*\{[^}]*typeof stop === 'function'[^}]*stop\(\)",
             "the event subscription must be disposed on unmount",
         )
-        self.assertEqual(self.code.count("3000"), 1, "the mission-control poll interval is 3 s")
+        self.assertEqual(self.code.count("3000"), 1, "the preview poll interval is 3 s")
 
     # -- appearance --------------------------------------------------------
 
@@ -274,6 +274,7 @@ class DesktopPluginContractTest(unittest.TestCase):
             "/tasks/{id}/capabilities",
             "/tasks/{id}/artifact",
             "/tasks/{id}/approve",
+            "/tasks/{id}/present",
             "/capabilities",
             "/capabilities/consent",
             "/capabilities/install",
@@ -490,6 +491,78 @@ console.log(JSON.stringify(cases.map(message => helpers.parseRestError(message))
         self.assertIn("SHA", parsed[2]["detail"])
         self.assertEqual(parsed[3]["status"], 500)
         self.assertIsNone(parsed[4]["status"])
+
+
+    def test_completion_identity_and_quiet_setting_are_pure(self) -> None:
+        report = self._run_helpers(
+            """
+const tasks = [
+  { id: 'a', state: 'completed', version: 3 },
+  { id: 'b', state: 'running', version: 1 },
+  { id: 'a', state: 'completed', version: 3 },
+  { id: 'c', state: 'completed', version: 0 },
+  { id: 'bad id', state: 'completed', version: 1 },
+  { id: 'd', state: 'completed', version: 2 },
+  null
+]
+const seen = new Set(['a:3'])
+const first = helpers.newlyCompleted(tasks, seen)
+const grown = new Set([...seen, 'c:0', 'd:2'])
+const second = helpers.newlyCompleted(tasks, grown)
+console.log(JSON.stringify({
+  keys: tasks.map(task => helpers.completionKey(task)),
+  fresh: first.map(task => task.id),
+  again: second.map(task => task.id),
+  quiet: [true, '1', 'true', 'quiet', 'on', false, '0', '', null].map(value => helpers.isQuietValue(value))
+}))
+"""
+        )
+        self.assertEqual(
+            report["keys"],
+            ["a:3", None, "a:3", "c:0", None, "d:2", None],
+        )
+        self.assertEqual(report["fresh"], ["c", "d"])
+        self.assertEqual(report["again"], [], "an observed version must not present twice")
+        self.assertEqual(
+            report["quiet"],
+            [True, True, True, True, True, False, False, False, False],
+        )
+
+    def test_preview_polling_touches_only_the_preview_route_every_three_seconds(self) -> None:
+        self.assertIn("PREVIEW_POLL_MS = 3000", self.code)
+        self.assertRegex(
+            self.code, r"usePolling\(ctx,\s*pollPreview,\s*PREVIEW_POLL_MS\)"
+        )
+        block = re.search(
+            r"const pollPreview = useCallback\((.*?)\n  \}, \[ctx\]\)",
+            self.code,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(block, "the selected preview needs its own poll")
+        body = block.group(1)
+        self.assertIn("/preview", body)
+        self.assertNotIn("/log", body)
+        self.assertNotIn("/capabilities", body)
+        self.assertNotRegex(body, r"/tasks/\$\{encodeURIComponent\(id\)\}`")
+
+    def test_proactive_presentation_is_storage_backed_and_quiet_aware(self) -> None:
+        self.assertRegex(
+            self.code,
+            r"ctx\.rest\(`/tasks/\$\{encodeURIComponent\([^`]+\)\}/present`",
+            "proactive presentation must call the present route",
+        )
+        self.assertIn("ctx.storage", self.code, "presented keys must persist where possible")
+        self.assertIn("neo.presented", self.code)
+        self.assertIn("neo.quiet", self.code)
+        self.assertIn("/neo?task=", self.code, "completion must navigate to the task")
+        self.assertIn("host.navigate(", self.code)
+        self.assertIn("placeholder", self.code.lower())
+        self.assertIn("completion", self.code.lower())
+        # Proactive work may present and navigate; it must never approve or publish.
+        self.assertNotRegex(
+            self.code,
+            r"present`[^`]*/approve|/approve[^`]*present`",
+        )
 
 
 if __name__ == "__main__":
