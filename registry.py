@@ -90,7 +90,7 @@ ACTIVE_STATES = (
     "unknown",
 )
 _ACTIVE_SQL = ", ".join("'%s'" % state for state in ACTIVE_STATES)
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 
 _SCHEMA = (
@@ -116,6 +116,10 @@ _SCHEMA = (
         result_summary TEXT,
         error_code TEXT,
         error_detail TEXT,
+        pid INTEGER,
+        pgid INTEGER,
+        log_path TEXT,
+        heartbeat_at REAL,
         created_at REAL NOT NULL,
         updated_at REAL NOT NULL,
         started_at REAL,
@@ -417,6 +421,20 @@ class Registry:
                 connection.execute("DROP INDEX IF EXISTS tasks_active_dedupe")
             for statement in _SCHEMA:
                 connection.execute(statement)
+            task_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            for column, declaration in (
+                ("pid", "INTEGER"),
+                ("pgid", "INTEGER"),
+                ("log_path", "TEXT"),
+                ("heartbeat_at", "REAL"),
+            ):
+                if column not in task_columns:
+                    connection.execute(
+                        "ALTER TABLE tasks ADD COLUMN %s %s" % (column, declaration)
+                    )
             connection.execute(
                 "INSERT OR IGNORE INTO registry_settings (key, value) "
                 "VALUES ('max_parallel', 4)"
@@ -591,6 +609,10 @@ class Registry:
             "result_summary",
             "error_code",
             "error_detail",
+            "pid",
+            "pgid",
+            "log_path",
+            "heartbeat_at",
             "started_at",
             "finished_at",
         }

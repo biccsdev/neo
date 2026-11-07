@@ -99,7 +99,7 @@ class WorkerTokenTestCase(unittest.TestCase):
 
         with sqlite3.connect(self.db_path) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         token = self.tokens.issue(self.task["id"])
         self.assertEqual(len(self.token_rows()), 1)
         self.assertTrue(self.tokens.verify(self.task["id"], token))
