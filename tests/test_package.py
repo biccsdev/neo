@@ -59,16 +59,12 @@ class RecordingContext:
     def __init__(self) -> None:
         self.tools: list[str] = []
         self.hooks: list[str] = []
-        self.skills: list[str] = []
 
     def register_tool(self, name: str | None = None, **_kwargs) -> None:
         self.tools.append(str(name))
 
     def register_hook(self, hook_name: str | None = None, **_kwargs) -> None:
         self.hooks.append(str(hook_name))
-
-    def register_skill(self, name: str | None = None, **_kwargs) -> None:
-        self.skills.append(str(name))
 
 
 class ManifestMetadataTests(unittest.TestCase):
@@ -107,6 +103,7 @@ class ManifestMetadataTests(unittest.TestCase):
 class RegisterEntrypointTests(unittest.TestCase):
     def test_register_succeeds_with_recording_context(self) -> None:
         module = load_entrypoint()
+        self.addCleanup(sys.modules.pop, MODULE_NAME, None)
 
         register = getattr(module, "register", None)
         if not callable(register):
@@ -114,6 +111,13 @@ class RegisterEntrypointTests(unittest.TestCase):
 
         ctx = RecordingContext()
         self.assertIsNone(register(ctx))
+        self.assertEqual(ctx.tools, [])
+        self.assertEqual(ctx.hooks, [])
+
+    def test_package_version_matches_manifest(self) -> None:
+        module = load_entrypoint()
+        self.addCleanup(sys.modules.pop, MODULE_NAME, None)
+        self.assertEqual(module.__version__, str(load_manifest()["version"]))
 
 
 if __name__ == "__main__":
