@@ -14,6 +14,7 @@ from state_machine import (
     CompletionEvidence,
     Evidence,
     TaskState,
+    UnknownStateError,
     transition as validate_transition,
 )
 
@@ -64,6 +65,14 @@ class SchemaVersionError(RegistryError):
 
 class DuplicateTaskError(RegistryError):
     """Another active task already owns this conversation dedupe key."""
+
+
+class TaskNotFoundError(RegistryError):
+    """An operation referenced a task that does not exist."""
+
+    def __init__(self, task_id: str) -> None:
+        super().__init__("task %s does not exist" % task_id)
+        self.task_id = task_id
 
 
 ACTIVE_STATES = (
@@ -134,7 +143,13 @@ _SCHEMA = (
     )
     """,
     """
-    CREATE TRIGGER IF NOT EXISTS tasks_max_parallel_insert
+    DROP TRIGGER IF EXISTS tasks_max_parallel_insert
+    """,
+    """
+    DROP TRIGGER IF EXISTS tasks_max_parallel_update
+    """,
+    """
+    CREATE TRIGGER tasks_max_parallel_insert
     BEFORE INSERT ON tasks
     WHEN NEW.state IN (
         'starting', 'running', 'waiting', 'needs_approval',
@@ -154,7 +169,7 @@ _SCHEMA = (
     END
     """,
     """
-    CREATE TRIGGER IF NOT EXISTS tasks_max_parallel_update
+    CREATE TRIGGER tasks_max_parallel_update
     BEFORE UPDATE OF state ON tasks
     WHEN NEW.state IN (
         'starting', 'running', 'waiting', 'needs_approval',
@@ -246,6 +261,20 @@ def _json_string_list(raw: object, field: str) -> tuple:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise RegistryError("%s must be a JSON list of strings" % field)
     return tuple(value)
+
+
+def _coerce_target(value: Union[TaskState, str]) -> TaskState:
+    """Return a TaskState while preserving the state-machine error type."""
+    if isinstance(value, TaskState):
+        return value
+    if isinstance(value, str):
+        try:
+            return TaskState(value)
+        except ValueError:
+            raise UnknownStateError("unknown task target state: %r" % value) from None
+    raise UnknownStateError(
+        "task target state must be a state name, got %s" % type(value).__name__
+    )
 
 
 class Registry:
@@ -376,9 +405,10 @@ class Registry:
                 )
                 """
             ).fetchone()["count"]
-            max_parallel = connection.execute(
+            limit_row = connection.execute(
                 "SELECT value FROM registry_settings WHERE key = 'max_parallel'"
-            ).fetchone()["value"]
+            ).fetchone()
+            max_parallel = int(limit_row["value"]) if limit_row is not None else 4
             if executing >= max_parallel:
                 state = "queued"
             if resource_key is not None and state == "starting":
@@ -529,7 +559,7 @@ class Registry:
             if row["version"] != expected_version:
                 raise VersionConflictError(task_id, expected_version, row["version"])
 
-            target_state = TaskState(target)
+            target_state = _coerce_target(target)
             if row["state"] == "queued" and target_state == TaskState.STARTING:
                 active = connection.execute(
                     "SELECT COUNT(*) AS count FROM tasks WHERE state IN (%s)"
@@ -661,6 +691,13 @@ class Registry:
             ).fetchone()
             connection.execute("COMMIT")
             return dict(row)
+        except sqlite3.IntegrityError as error:
+            connection.execute("ROLLBACK")
+            if "FOREIGN KEY constraint failed" in str(error):
+                raise TaskNotFoundError(task_id) from error
+            raise RegistryError(
+                "event insert failed integrity check: %s" % error
+            ) from error
         except Exception:
             connection.execute("ROLLBACK")
             raise
@@ -673,7 +710,7 @@ class Registry:
             raise InvalidCursorError("event cursor must be a non-negative integer")
         if isinstance(since, int):
             cursor_value = since
-        elif isinstance(since, str) and since.isdigit():
+        elif isinstance(since, str) and since.isascii() and since.isdigit():
             cursor_value = int(since)
         else:
             raise InvalidCursorError("event cursor must be a non-negative integer")

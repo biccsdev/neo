@@ -19,12 +19,14 @@ from registry import (  # noqa: E402
     InvalidCursorError,
     Registry,
     ResourceBusyError,
+    TaskNotFoundError,
     VersionConflictError,
 )
 from state_machine import (  # noqa: E402
     CompletionEvidence,
     IncompleteEvidenceError,
     InvalidTransitionError,
+    UnknownStateError,
 )
 
 
@@ -433,6 +435,73 @@ class RegistryTestCase(unittest.TestCase):
             self.registry.events_since("not-a-number")
         with self.assertRaises(InvalidCursorError):
             self.registry.events_since(-1)
+        with self.assertRaises(InvalidCursorError):
+            self.registry.events_since("²")
+        with self.assertRaises(InvalidCursorError):
+            self.registry.events_since("١٢")
+
+    def test_unknown_transition_target_keeps_state_machine_error_type(self) -> None:
+        task = self.registry.create_task(
+            conversation_key="conversation", kind="coding", intent="one"
+        )
+        with self.assertRaises(UnknownStateError):
+            self.registry.transition_task(
+                task["id"], "not-a-state", expected_version=task["version"]
+            )
+
+    def test_event_for_unknown_task_is_a_domain_error(self) -> None:
+        with self.assertRaises(TaskNotFoundError):
+            self.registry.append_event("missing", "task.updated", {})
+
+    def test_missing_parallel_setting_falls_back_to_four(self) -> None:
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("DELETE FROM registry_settings")
+
+        states = [
+            self.registry.create_task(
+                conversation_key="conversation", kind="coding", intent="task-%s" % index
+            )["state"]
+            for index in range(5)
+        ]
+        self.assertEqual(states, ["starting", "starting", "starting", "starting", "queued"])
+
+    def test_migration_replaces_an_older_trigger_body(self) -> None:
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("DROP TRIGGER tasks_max_parallel_insert")
+            connection.execute(
+                """
+                CREATE TRIGGER tasks_max_parallel_insert
+                BEFORE INSERT ON tasks
+                WHEN NEW.state IN ('starting', 'running')
+                BEGIN
+                    SELECT RAISE(ABORT, 'max parallel tasks exceeded')
+                    WHERE (SELECT COUNT(*) FROM tasks WHERE state IN ('starting', 'running'))
+                          >= (SELECT value FROM registry_settings WHERE key = 'max_parallel');
+                END
+                """
+            )
+            connection.execute("PRAGMA user_version = 1")
+
+        migrated = Registry(path=self.db_path)
+        with sqlite3.connect(self.db_path) as connection:
+            trigger_sql = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND name = 'tasks_max_parallel_insert'"
+            ).fetchone()[0]
+            self.assertIn("COALESCE", trigger_sql)
+            connection.execute("DELETE FROM registry_settings")
+            for index in range(4):
+                connection.execute(
+                    "INSERT INTO tasks (id, kind, intent, state, created_at, updated_at) "
+                    "VALUES (?, 'coding', 'i', 'starting', 1, 1)",
+                    ("probe-%s" % index,),
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "max parallel"):
+                connection.execute(
+                    "INSERT INTO tasks (id, kind, intent, state, created_at, updated_at) "
+                    "VALUES ('probe-4', 'coding', 'i', 'starting', 1, 1)"
+                )
+        self.assertEqual(migrated.max_parallel, 2)
 
     def test_max_parallel_is_enforced_by_database_at_insertion(self) -> None:
         first = self.registry.create_task(
