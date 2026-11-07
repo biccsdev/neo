@@ -1,0 +1,7 @@
+{"type": "system", "subtype": "init", "model": "deepseek-v4-flash", "session_id": "", "timestamp": 1794089674890}
+{"type": "text", "text": "RES", "timestamp": 1794089676401}
+{"type": "text", "text": "UM", "timestamp": 1794089676401}
+{"type": "text", "text": "ED", "timestamp": 1794089676404}
+{"type": "text", "text": "-", "timestamp": 1794089676407}
+{"type": "text", "text": "OK", "timestamp": 1794089676407}
+{"type": "result", "session_id": "local-d495be544248caa76186dbbf8fc4a04938ad5ad4e2949c52f637d080e95fe402", "exit_code": 0, "text": "RESUMED-OK", "tokens": {"input": 30121, "output": 14, "total": 30135, "cache_read": 16128, "cache_write": 0}, "duration_ms": 11674, "timestamp": 1794089686564}

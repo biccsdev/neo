@@ -19,6 +19,24 @@ Never print, log, paste or forward the token. Never edit the NEO database, the
 plugin files or another task's rows. If the token is missing, stop and report
 that; do not guess one.
 
+## Your session
+
+You run as a detached `hermes chat` worker session, launched by NEO with
+`--oneshot`, `--query-file` and the `neo-worker` skill preloaded. NEO keeps the
+session id it reported so it can resume exactly this session later; you do not
+need to save or repeat it.
+
+- `NEO_WORKER=1` marks your process as a worker. It is why starting another NEO
+  task from here is refused at the tool layer.
+- Your task intent arrives in the prompt file, not on a command line. Treat it
+  as the whole scope: keep the work inside this task and its workdir.
+- The bridge tools are your only channel to NEO. Everything you claim must go
+  through them; nothing you print is read as a task update.
+
+Never claim completion from a process exit. A clean exit, a quiet stream and a
+zero status code say nothing about whether the work was done — only verified
+files named in `neo_task_complete` do.
+
 ## Reporting progress
 
 Call `neo_task_update(task_id, token, state, progress?, detail?)` while you

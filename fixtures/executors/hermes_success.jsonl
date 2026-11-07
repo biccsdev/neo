@@ -1,0 +1,9 @@
+{"type": "system", "subtype": "init", "model": "deepseek-v4-flash", "session_id": "", "timestamp": 1794089657045}
+{"type": "text", "text": "N", "timestamp": 1794089658399}
+{"type": "text", "text": "EO", "timestamp": 1794089658410}
+{"type": "text", "text": "-C", "timestamp": 1794089658413}
+{"type": "text", "text": "AN", "timestamp": 1794089658414}
+{"type": "text", "text": "ARY", "timestamp": 1794089658414}
+{"type": "text", "text": "-", "timestamp": 1794089658415}
+{"type": "text", "text": "OK", "timestamp": 1794089658415}
+{"type": "result", "session_id": "local-d495be544248caa76186dbbf8fc4a04938ad5ad4e2949c52f637d080e95fe402", "exit_code": 0, "text": "NEO-CANARY-OK", "tokens": {"input": 15050, "output": 8, "total": 15058, "cache_read": 1280, "cache_write": 0}, "duration_ms": 11494, "timestamp": 1794089668539}

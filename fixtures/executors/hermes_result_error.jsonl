@@ -1,0 +1,2 @@
+{"type": "system", "subtype": "init", "model": "deepseek-v4-flash", "session_id": "", "timestamp": 1794089654009}
+{"type": "result", "session_id": "", "exit_code": 2, "text": "", "tokens": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_write": 0}, "duration_ms": 0, "error": "Unsupported gateway CLI options: --run-budget. No local fallback or policy changes were made.", "timestamp": 1794089654009}

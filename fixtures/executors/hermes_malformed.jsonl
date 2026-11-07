@@ -1,0 +1,4 @@
+{"type": "system", "subtype": "init", "model": "deepseek-v4-flash", "session_id": "", "timestamp": 1794089674890}
+{"type": "text", "text": "partial", "timestamp": 1794089676401}
+{"type": "text", "text": " output",
+{"type": "result", "session_id": "local-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "exit_code": 0, "text": "partial output", "tokens": {"input": 10, "output": 2, "total": 12, "cache_read": 0, "cache_write": 0}, "duration_ms": 40, "timestamp": 1794089676410}
