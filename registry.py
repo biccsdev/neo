@@ -609,6 +609,23 @@ class Registry:
         finally:
             connection.close()
 
+    def unfinished_tasks(self) -> list:
+        """Return every non-terminal row, oldest first.
+
+        Restart recovery scans this list. It includes ``queued`` rows, because a
+        queued task is unfinished work even though no process owns it yet.
+        """
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM tasks "
+                "WHERE state = 'queued' OR state IN (%s) "
+                "ORDER BY created_at, id" % _ACTIVE_SQL
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
     def update_task(
         self, task_id: str, *, expected_version: int, **changes: object
     ) -> dict:

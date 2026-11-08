@@ -54,8 +54,8 @@ EXPECTED_TRANSITIONS: dict[TaskState, set[TaskState]] = {
     STARTING: {RUNNING, QUEUED, FAILED, UNKNOWN},
     RUNNING: {WAITING, NEEDS_APPROVAL, NEEDS_INPUT, COMPLETED, FAILED, CANCELLING},
     WAITING: {RUNNING, FAILED, CANCELLED},
-    NEEDS_APPROVAL: {RUNNING, QUEUED, CANCELLED},
-    NEEDS_INPUT: {RUNNING, QUEUED, CANCELLED},
+    NEEDS_APPROVAL: {RUNNING, QUEUED, CANCELLED, FAILED, UNKNOWN},
+    NEEDS_INPUT: {RUNNING, QUEUED, CANCELLED, FAILED, UNKNOWN},
     CANCELLING: {CANCELLED, FAILED, UNKNOWN},
     UNKNOWN: {RUNNING, FAILED, CANCELLED},
     COMPLETED: set(),
@@ -299,6 +299,31 @@ class CompletionEvidenceTests(unittest.TestCase):
             transition(RUNNING, WAITING, evidence=PROCESS_RECEIPT),
             WAITING,
         )
+
+
+class RestartRecoveryEdgeTests(unittest.TestCase):
+    """Task 22 widened exactly two edges, deliberately.
+
+    A worker can die while its task waits for a human. Without these edges the
+    row would sit in ``needs_approval``/``needs_input`` for ever and pretend the
+    work is still alive. The widened edges only ever fall to ``failed`` or
+    ``unknown``; they add no route to completion.
+    """
+
+    def test_a_waiting_worker_can_be_recorded_as_failed_or_unknown(self) -> None:
+        for source in (NEEDS_APPROVAL, NEEDS_INPUT):
+            with self.subTest(source=source.value):
+                self.assertIs(transition(source, FAILED), FAILED)
+                self.assertIs(transition(source, UNKNOWN), UNKNOWN)
+
+    def test_the_widened_edges_never_reach_completion(self) -> None:
+        for source in (NEEDS_APPROVAL, NEEDS_INPUT):
+            with self.subTest(source=source.value):
+                self.assertNotIn(COMPLETED, allowed_targets(source))
+                self.assertFalse(
+                    can_transition(source, COMPLETED, evidence=CONFIRMED_EVIDENCE)
+                )
+                self.assertFalse(can_transition(source, CANCELLING))
 
 
 if __name__ == "__main__":

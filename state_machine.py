@@ -5,7 +5,12 @@ may it enter next? It performs no I/O, keeps no clock and touches no database,
 so the same rules serve the SQLite task service, the worker bridge and the API.
 
 The transition table is the one approved in the implementation plan, section
-4.2. Two rules need more than a table:
+4.2, with one deliberate amendment: ``needs_approval`` and ``needs_input`` may
+fall to ``failed`` or ``unknown``. A worker can die while its task waits for a
+human, and a dead worker must be recorded honestly instead of leaving the row
+pretending to be alive. Those edges never reach ``completed``.
+
+Two further rules need more than a table:
 
 * Terminal states are immutable. Retrying is a new child task, never a
   reopening of the finished one.
@@ -68,10 +73,22 @@ ALLOWED_TRANSITIONS: Mapping[TaskState, "frozenset[TaskState]"] = MappingProxyTy
             {TaskState.RUNNING, TaskState.FAILED, TaskState.CANCELLED}
         ),
         TaskState.NEEDS_APPROVAL: frozenset(
-            {TaskState.RUNNING, TaskState.QUEUED, TaskState.CANCELLED}
+            {
+                TaskState.RUNNING,
+                TaskState.QUEUED,
+                TaskState.CANCELLED,
+                TaskState.FAILED,
+                TaskState.UNKNOWN,
+            }
         ),
         TaskState.NEEDS_INPUT: frozenset(
-            {TaskState.RUNNING, TaskState.QUEUED, TaskState.CANCELLED}
+            {
+                TaskState.RUNNING,
+                TaskState.QUEUED,
+                TaskState.CANCELLED,
+                TaskState.FAILED,
+                TaskState.UNKNOWN,
+            }
         ),
         TaskState.CANCELLING: frozenset(
             {TaskState.CANCELLED, TaskState.FAILED, TaskState.UNKNOWN}

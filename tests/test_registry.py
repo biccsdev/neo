@@ -545,5 +545,54 @@ class RegistryTestCase(unittest.TestCase):
                 )
 
 
+class UnfinishedTaskQueryTests(unittest.TestCase):
+    """The restart pass needs every row that has not reached a terminal state."""
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.db_path = Path(self.tempdir.name) / "registry.db"
+
+    def test_unfinished_tasks_exclude_terminal_rows_and_keep_creation_order(self) -> None:
+        registry = Registry(path=self.db_path, max_parallel=4)
+        first = registry.create_task(
+            conversation_key="conversation", kind="general", intent="first"
+        )
+        second = registry.create_task(
+            conversation_key="conversation", kind="general", intent="second"
+        )
+        done = registry.create_task(
+            conversation_key="conversation", kind="general", intent="done"
+        )
+        running = registry.transition_task(
+            done["id"], "running", expected_version=done["version"]
+        )
+        registry.transition_task(
+            running["id"],
+            "completed",
+            expected_version=running["version"],
+            evidence=CompletionEvidence(executor_confirmed=True),
+        )
+
+        rows = registry.unfinished_tasks()
+
+        self.assertEqual([row["id"] for row in rows], [first["id"], second["id"]])
+        self.assertEqual([row["state"] for row in rows], ["starting", "starting"])
+
+    def test_unfinished_tasks_include_queued_rows(self) -> None:
+        registry = Registry(path=self.db_path, max_parallel=1)
+        holder = registry.create_task(
+            conversation_key="conversation", kind="general", intent="holder"
+        )
+        queued = registry.create_task(
+            conversation_key="conversation", kind="general", intent="queued"
+        )
+        self.assertEqual(queued["state"], "queued")
+
+        rows = registry.unfinished_tasks()
+
+        self.assertEqual([row["id"] for row in rows], [holder["id"], queued["id"]])
+
+
 if __name__ == "__main__":
     unittest.main()

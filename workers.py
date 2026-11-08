@@ -2,8 +2,13 @@
 
 The supervisor owns processes, not lifecycle truth. It persists receipts and
 worker metadata, cancels by process group, and lets the task service decide
-valid state changes. A detached worker outlives the viewer; restart
-reconciliation is a later task and never guesses completion from a PID.
+valid state changes. A detached worker outlives the viewer.
+
+Restart recovery lives here too. :meth:`ProcessSupervisor.reconcile` reads the
+durable task rows once, checks each recorded PID against the operating system,
+and records an honest outcome. It never launches, resumes or kills anything: a
+live worker is adopted by a polling monitor because a process this interpreter
+did not spawn cannot be waited on, and a dead worker is already dead.
 """
 
 from __future__ import annotations
@@ -17,12 +22,21 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 from uuid import uuid4
 
 from events import TaskService
-from registry import CapacityExceededError, ResourceBusyError, VersionConflictError
-from state_machine import InvalidTransitionError, TerminalStateError
+from registry import (
+    CapacityExceededError,
+    RegistryError,
+    ResourceBusyError,
+    VersionConflictError,
+)
+from state_machine import (
+    InvalidTransitionError,
+    StateMachineError,
+    TerminalStateError,
+)
 from neo_tools import WorkerTokenStore
 
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
@@ -30,6 +44,70 @@ _UNCLAIMED_EXIT_STATES = frozenset(
     {"queued", "starting", "running", "waiting", "cancelling", "unknown"}
 )
 _SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+RECOVERABLE_STATES = frozenset(
+    {
+        "queued",
+        "starting",
+        "running",
+        "waiting",
+        "needs_approval",
+        "needs_input",
+        "cancelling",
+        "unknown",
+    }
+)
+"""Every state a restart passes over; queued work is unfinished but processless."""
+
+_PROCESSLESS_STATES = frozenset({"queued"})
+_ZOMBIE_STATE_PREFIX = "Z"
+_PS_TIMEOUT = 2.0
+_ADOPT_POLL_INTERVAL = 0.05
+
+
+def _state_is_zombie(pid: int) -> bool:
+    """Return whether ``ps`` reports ``pid`` as a reaped-but-unwaited process.
+
+    ``os.kill(pid, 0)`` succeeds for a zombie, so a signal probe alone would
+    call a dead worker alive. ``ps`` is POSIX-portable and bounded by a
+    timeout. A ``ps`` that cannot answer is read as "not a zombie"; the caller
+    still never treats the process as finished work, so the error stays
+    conservative.
+    """
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=_PS_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    state = completed.stdout.strip()
+    return state.upper().startswith(_ZOMBIE_STATE_PREFIX)
+
+
+def process_alive(pid: int) -> bool:
+    """Return whether ``pid`` names a live, non-zombie process on this host.
+
+    This is a read-only probe: signalling with ``0`` performs no delivery, and
+    the ``ps`` call only reads state. A process this interpreter did not spawn
+    can be observed but never waited on, which is why reconciliation polls.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError("pid must be a positive integer")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except OSError:
+        return False
+    return not _state_is_zombie(pid)
 
 
 class RecursionRefusedError(RuntimeError):
@@ -45,6 +123,8 @@ class ProcessSupervisor:
         tokens: WorkerTokenStore,
         *,
         log_dir: Union[str, Path],
+        alive_fn: Optional[Callable[[int], bool]] = None,
+        poll_interval: float = _ADOPT_POLL_INTERVAL,
     ) -> None:
         self._service = service
         self._registry = service.registry
@@ -54,8 +134,11 @@ class ProcessSupervisor:
         self._processes = {}
         self._pending = {}
         self._watchers = {}
+        self._adopted = {}
         self._stop = threading.Event()
         self._maintenance = None
+        self._alive = alive_fn or process_alive
+        self._poll_interval = max(0.01, float(poll_interval))
 
     # -- submission -----------------------------------------------------
 
@@ -384,17 +467,20 @@ class ProcessSupervisor:
         temporary.write_text(json.dumps(receipt))
         os.replace(temporary, receipt_path)
 
-    def _update_worker(self, task_id: str, pid: int, state: str) -> None:
+    def _update_worker(
+        self, task_id: str, pid: Optional[int], state: str
+    ) -> None:
+        statement = "UPDATE workers SET state = ?, heartbeat_at = ? WHERE task_id = ?"
+        parameters: list = [state, time.time(), task_id]
+        if pid is not None:
+            statement += " AND pid = ?"
+            parameters.append(pid)
         connection = self._registry._connect()
         started = False
         try:
             connection.execute("BEGIN IMMEDIATE")
             started = True
-            connection.execute(
-                "UPDATE workers SET state = ?, heartbeat_at = ? "
-                "WHERE task_id = ? AND pid = ?",
-                (state, time.time(), task_id, pid),
-            )
+            connection.execute(statement, parameters)
             connection.execute("COMMIT")
         except Exception:
             if started:
@@ -403,12 +489,321 @@ class ProcessSupervisor:
         finally:
             connection.close()
 
+    def _update_worker_best_effort(
+        self, task_id: str, pid: Optional[int], state: str
+    ) -> None:
+        """Worker bookkeeping must never undo a task outcome already recorded."""
+        try:
+            self._update_worker(task_id, pid, state)
+        except (RegistryError, ValueError, TypeError, OSError):
+            pass
+
     @staticmethod
     def _kill_group(pgid: int) -> None:
         try:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+    # -- restart recovery ------------------------------------------------
+
+    def reconcile(self) -> dict:
+        """Record an honest outcome for every row a previous run left behind.
+
+        The pass is read-mostly and bounded by the number of unfinished rows. It
+        creates no task, launches no process and signals no worker. A live PID
+        is adopted by a polling monitor; a dead or missing one becomes ``failed``
+        (or ``unknown`` when a cancellation cannot be confirmed). Completion is
+        never inferred here: only the executor can complete a task.
+
+        One corrupt row is reported in ``errors`` and skipped. Every other row
+        is still reconciled in its own transaction, so no unrelated task is
+        rolled back.
+        """
+        summary = {
+            "scanned": 0,
+            "adopted": [],
+            "failed": [],
+            "unknown": [],
+            "queued": [],
+            "watching": [],
+            "errors": [],
+        }
+        with self._lock:
+            try:
+                rows = self._registry.unfinished_tasks()
+            except Exception as error:  # a damaged registry must not stop startup
+                summary["errors"].append(
+                    {"task_id": None, "error": type(error).__name__}
+                )
+                return summary
+            for row in rows:
+                task = dict(row)
+                if task.get("state") not in RECOVERABLE_STATES:
+                    continue
+                summary["scanned"] += 1
+                try:
+                    self._reconcile_row(task, summary)
+                except (
+                    RegistryError,
+                    StateMachineError,
+                    KeyError,
+                    ValueError,
+                    TypeError,
+                    OSError,
+                ) as error:
+                    summary["errors"].append(
+                        {
+                            "task_id": task.get("id"),
+                            "error": type(error).__name__,
+                            "detail": str(error)[:200],
+                        }
+                    )
+            try:
+                self.drain_pending()
+            except Exception:
+                pass
+        return summary
+
+    def _reconcile_row(self, task: dict, summary: dict) -> None:
+        task_id = task["id"]
+        state = task["state"]
+        if state in _PROCESSLESS_STATES:
+            # A queued task has no process yet; it is not stale, just waiting.
+            summary["queued"].append(task_id)
+            return
+        with self._lock:
+            if task_id in self._watchers:
+                summary["watching"].append(task_id)
+                return
+        log_path = task.get("log_path") or str(self._log_path(task_id))
+        pid = self._recorded_pid(task)
+        if pid is None:
+            self._record_outcome(
+                task_id,
+                pid=None,
+                receipt=None,
+                summary=summary,
+                reason="worker_missing",
+                detail="no worker process was recorded for this task; "
+                "it never reported completion",
+            )
+            return
+        if self._alive(pid):
+            if self._adopt(task_id, pid, log_path):
+                summary["adopted"].append(task_id)
+            else:
+                summary["watching"].append(task_id)
+            return
+        receipt = self._read_receipt(task_id, log_path)
+        reason, detail = self._exit_outcome(state, receipt)
+        self._record_outcome(
+            task_id,
+            pid=pid,
+            receipt=receipt,
+            summary=summary,
+            reason=reason,
+            detail=detail,
+        )
+
+    @staticmethod
+    def _recorded_pid(task: dict) -> Optional[int]:
+        """Return the durable PID, or ``None`` when the row never had one."""
+        pid = task.get("pid")
+        if pid is None:
+            return None
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ValueError(
+                "task %s records a pid that is not a positive integer"
+                % task.get("id")
+            )
+        return pid
+
+    @staticmethod
+    def _exit_outcome(state: str, receipt: Optional[dict]) -> tuple:
+        """Map a finished process plus its receipt to an honest reason."""
+        if receipt is None:
+            if state == "cancelling":
+                return (
+                    "cancellation_unconfirmed",
+                    "worker vanished before its cancellation could be confirmed",
+                )
+            return (
+                "worker_lost",
+                "worker process is gone and no receipt was recorded; "
+                "it never reported completion",
+            )
+        exit_code = receipt.get("exit_code")
+        if exit_code is None:
+            return (
+                "worker_lost",
+                "worker receipt records no exit status; "
+                "it never reported completion",
+            )
+        if exit_code == 0:
+            return (
+                "worker_exit_zero",
+                "worker exited with status 0 without reporting completion",
+            )
+        return (
+            "worker_exit_nonzero",
+            "worker exited with status %s without reporting completion"
+            % exit_code,
+        )
+
+    def _receipt_path(
+        self, task_id: str, log_path: Union[str, Path, None]
+    ) -> Path:
+        path = Path(log_path) if log_path else self._log_path(task_id)
+        return path.with_suffix(".receipt.json")
+
+    def _read_receipt(
+        self, task_id: str, log_path: Union[str, Path, None]
+    ) -> Optional[dict]:
+        """Read this task's receipt, refusing anything unreadable or foreign."""
+        try:
+            receipt = json.loads(self._receipt_path(task_id, log_path).read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(receipt, dict):
+            return None
+        recorded_task = receipt.get("task_id")
+        if recorded_task not in (None, task_id):
+            return None
+        exit_code = receipt.get("exit_code")
+        if exit_code is not None and (
+            isinstance(exit_code, bool) or not isinstance(exit_code, int)
+        ):
+            return None
+        return receipt
+
+    def _record_outcome(
+        self,
+        task_id: str,
+        *,
+        pid: Optional[int],
+        receipt: Optional[dict],
+        summary: dict,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """Persist one recovery outcome with its audit payload."""
+        current = self._service.get_task(task_id)
+        if current is None or current["state"] in TERMINAL_STATES:
+            return
+        target = "unknown" if reason == "cancellation_unconfirmed" else "failed"
+        resource_key = current.get("resource_key")
+        try:
+            updated = self._service.transition(
+                task_id,
+                target,
+                expected_version=current["version"],
+                summary=detail,
+                event_extra={
+                    "recovered": True,
+                    "error_code": reason,
+                    "recovery": {
+                        "pid": pid,
+                        "process_alive": False,
+                        "receipt": receipt is not None,
+                        "exit_code": receipt.get("exit_code") if receipt else None,
+                        "reason": reason,
+                        "resource_key": resource_key,
+                        "resource_released": bool(resource_key),
+                    },
+                },
+            )
+        except VersionConflictError:
+            # Another writer owns this row; its version wins.
+            return
+        except (InvalidTransitionError, TerminalStateError, KeyError):
+            # An edge this recovery cannot take; leave the row reported as is.
+            return
+        try:
+            # Error columns are metadata; the task's state stays terminal.
+            updated = self._registry.update_task(
+                task_id,
+                expected_version=updated["version"],
+                error_code=reason,
+                error_detail=detail[:500],
+            )
+        except (RegistryError, KeyError, ValueError, TypeError):
+            pass
+        self._update_worker_best_effort(task_id, pid, target)
+        summary[target].append(task_id)
+
+    def _adopt(
+        self, task_id: str, pid: int, log_path: Union[str, Path]
+    ) -> bool:
+        """Start one monitor for an inherited worker, or report it already held."""
+        with self._lock:
+            if task_id in self._watchers:
+                return False
+            stop = threading.Event()
+            watcher = threading.Thread(
+                target=self._monitor_adopted,
+                args=(task_id, pid, log_path, stop),
+                name="neo-adopt-%s" % task_id,
+                daemon=True,
+            )
+            self._watchers[task_id] = watcher
+            self._adopted[task_id] = stop
+        watcher.start()
+        return True
+
+    def _monitor_adopted(
+        self,
+        task_id: str,
+        pid: int,
+        log_path: Union[str, Path],
+        stop: threading.Event,
+    ) -> None:
+        """Poll an inherited worker until it exits; never signal, never wait."""
+        try:
+            while not stop.wait(self._poll_interval):
+                try:
+                    alive = self._alive(pid)
+                except (OSError, ValueError):
+                    alive = False
+                if not alive:
+                    break
+            else:
+                # Closing the viewer abandons the monitor, not the task.
+                return
+            receipt = self._read_receipt(task_id, log_path)
+            task = self._service.get_task(task_id)
+            state = task["state"] if task is not None else "running"
+            reason, detail = self._exit_outcome(state, receipt)
+            self._record_outcome(
+                task_id,
+                pid=pid,
+                receipt=receipt,
+                summary={"failed": [], "unknown": []},
+                reason=reason,
+                detail=detail,
+            )
+        except Exception:
+            try:
+                self._record_outcome(
+                    task_id,
+                    pid=pid,
+                    receipt=None,
+                    summary={"failed": [], "unknown": []},
+                    reason="worker_lost",
+                    detail="worker supervision failed after restart; "
+                    "the task never reported completion",
+                )
+            except Exception:
+                pass
+        finally:
+            with self._lock:
+                if self._watchers.get(task_id) is threading.current_thread():
+                    self._watchers.pop(task_id, None)
+                self._adopted.pop(task_id, None)
+                try:
+                    self.drain_pending()
+                except Exception:
+                    pass
 
     # -- cancellation ---------------------------------------------------
 
@@ -528,12 +923,18 @@ class ProcessSupervisor:
             connection.close()
 
     def close(self) -> None:
-        """Stop queue maintenance and wait briefly for finished watchers.
+        """Stop queue maintenance, adopted monitors and finished watchers.
 
-        Detached workers are never killed. Watchers that are still waiting on a
-        live child are left running; a process exit does not wait for the viewer.
+        Detached workers are never killed. Adopted monitors stop polling; the
+        task itself is left to the next restart, which adopts the same PID again.
+        Watchers still waiting on a live child are left running; a process exit
+        does not wait for the viewer.
         """
         self._stop.set()
+        with self._lock:
+            adopted = list(self._adopted.values())
+        for stop in adopted:
+            stop.set()
         thread = self._maintenance
         if thread is not None:
             thread.join(timeout=1.0)
@@ -547,4 +948,4 @@ class ProcessSupervisor:
             watcher.join(timeout=remaining)
 
 
-__all__ = ["ProcessSupervisor", "RecursionRefusedError"]
+__all__ = ["ProcessSupervisor", "RecursionRefusedError", "process_alive"]

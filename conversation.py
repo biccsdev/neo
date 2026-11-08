@@ -576,6 +576,11 @@ class NeoRuntime:
         service = TaskService(registry)
         tokens = WorkerTokenStore(registry)
         supervisor = supervisor or ProcessSupervisor(service, tokens, log_dir=log_dir)
+        # Restart recovery: record an honest outcome for work a previous run left
+        # behind. It creates, launches and resumes nothing, so startup stays fast.
+        reconcile = getattr(supervisor, "reconcile", None)
+        if callable(reconcile):
+            reconcile()
         presenter = presenter or TaskPresenter(
             registry, PresentationService(MacOSOpener(), ledger=registry)
         )
