@@ -40,7 +40,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import schemas  # noqa: E402
-import tools  # noqa: E402
+import neo_tools as tools  # noqa: E402
 from artifacts import (  # noqa: E402
     ArtifactEscapesWorkdirError,
     ArtifactNotFoundError,
@@ -51,7 +51,7 @@ from artifacts import (  # noqa: E402
 from events import TaskService  # noqa: E402
 from registry import InvalidWorkerTokenError, Registry, VersionConflictError  # noqa: E402
 from state_machine import TerminalStateError  # noqa: E402
-from tools import (  # noqa: E402
+from neo_tools import (  # noqa: E402
     DEFAULT_PREVIEW_MAX_BYTES,
     PreviewTooLargeError,
     WorkerBridge,

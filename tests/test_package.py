@@ -59,12 +59,16 @@ class RecordingContext:
     def __init__(self) -> None:
         self.tools: list[str] = []
         self.hooks: list[str] = []
+        self.skills: list[str] = []
 
     def register_tool(self, name: str | None = None, **_kwargs) -> None:
         self.tools.append(str(name))
 
-    def register_hook(self, hook_name: str | None = None, **_kwargs) -> None:
+    def register_hook(self, hook_name: str | None = None, _callback=None, **_kwargs) -> None:
         self.hooks.append(str(hook_name))
+
+    def register_skill(self, name: str | None = None, _path=None, **_kwargs) -> None:
+        self.skills.append(str(name))
 
 
 class ManifestMetadataTests(unittest.TestCase):
@@ -96,8 +100,22 @@ class ManifestMetadataTests(unittest.TestCase):
     def test_manifest_requests_no_privileged_capabilities(self) -> None:
         manifest = load_manifest()
         self.assertEqual(manifest.get("capabilities") or [], [])
-        self.assertEqual(manifest.get("provides_tools") or [], [])
-        self.assertEqual(manifest.get("provides_hooks") or [], [])
+
+    def test_manifest_declares_the_conversational_tools_and_hook(self) -> None:
+        manifest = load_manifest()
+        self.assertEqual(
+            list(manifest.get("provides_tools") or []),
+            [
+                "neo_submit_task",
+                "neo_task_status",
+                "neo_task_list",
+                "neo_task_refine",
+                "neo_task_cancel",
+                "neo_task_frame_follow_up",
+                "neo_task_open",
+            ],
+        )
+        self.assertEqual(list(manifest.get("provides_hooks") or []), ["pre_llm_call"])
 
 
 class RegisterEntrypointTests(unittest.TestCase):
@@ -111,8 +129,20 @@ class RegisterEntrypointTests(unittest.TestCase):
 
         ctx = RecordingContext()
         self.assertIsNone(register(ctx))
-        self.assertEqual(ctx.tools, [])
-        self.assertEqual(ctx.hooks, [])
+        self.assertEqual(
+            ctx.tools,
+            [
+                "neo_submit_task",
+                "neo_task_status",
+                "neo_task_list",
+                "neo_task_refine",
+                "neo_task_cancel",
+                "neo_task_frame_follow_up",
+                "neo_task_open",
+            ],
+        )
+        self.assertEqual(ctx.hooks, ["pre_llm_call"])
+        self.assertEqual(ctx.skills, ["neo-operator", "neo-worker"])
 
     def test_package_version_matches_manifest(self) -> None:
         module = load_entrypoint()

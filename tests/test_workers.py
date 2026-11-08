@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 from events import TaskService  # noqa: E402
 from registry import Registry  # noqa: E402
 from state_machine import CompletionEvidence  # noqa: E402
-from tools import WorkerTokenStore  # noqa: E402
+from neo_tools import WorkerTokenStore  # noqa: E402
 from workers import ProcessSupervisor, RecursionRefusedError  # noqa: E402
 
 

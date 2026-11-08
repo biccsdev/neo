@@ -23,7 +23,7 @@ from uuid import uuid4
 from events import TaskService
 from registry import CapacityExceededError, ResourceBusyError, VersionConflictError
 from state_machine import InvalidTransitionError, TerminalStateError
-from tools import WorkerTokenStore
+from neo_tools import WorkerTokenStore
 
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 _UNCLAIMED_EXIT_STATES = frozenset(
@@ -53,6 +53,7 @@ class ProcessSupervisor:
         self._lock = threading.RLock()
         self._processes = {}
         self._pending = {}
+        self._watchers = {}
         self._stop = threading.Event()
         self._maintenance = None
 
@@ -136,6 +137,8 @@ class ProcessSupervisor:
             name="neo-worker-%s" % task_id,
             daemon=True,
         )
+        with self._lock:
+            self._watchers[task_id] = watcher
         watcher.start()
         try:
             return self._service.transition(
@@ -316,6 +319,8 @@ class ProcessSupervisor:
             with self._lock:
                 if self._processes.get(task_id) is process:
                     self._processes.pop(task_id, None)
+                if self._watchers.get(task_id) is threading.current_thread():
+                    self._watchers.pop(task_id, None)
                 self.drain_pending()
 
     @staticmethod
@@ -523,11 +528,23 @@ class ProcessSupervisor:
             connection.close()
 
     def close(self) -> None:
-        """Stop queue maintenance without killing detached workers."""
+        """Stop queue maintenance and wait briefly for finished watchers.
+
+        Detached workers are never killed. Watchers that are still waiting on a
+        live child are left running; a process exit does not wait for the viewer.
+        """
         self._stop.set()
         thread = self._maintenance
         if thread is not None:
             thread.join(timeout=1.0)
+        deadline = time.monotonic() + 2.0
+        with self._lock:
+            watchers = list(self._watchers.values())
+        for watcher in watchers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            watcher.join(timeout=remaining)
 
 
 __all__ = ["ProcessSupervisor", "RecursionRefusedError"]

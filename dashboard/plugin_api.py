@@ -900,7 +900,7 @@ def _default_services() -> Any:
     )
     supervisor = None
     try:
-        from tools import WorkerTokenStore
+        from neo_tools import WorkerTokenStore
         from workers import ProcessSupervisor
 
         supervisor = ProcessSupervisor(

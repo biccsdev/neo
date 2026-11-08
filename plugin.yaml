@@ -16,5 +16,13 @@ tags:
   - claude
   - blender
   - browser
-provides_tools: []
-provides_hooks: []
+provides_tools:
+  - neo_submit_task
+  - neo_task_status
+  - neo_task_list
+  - neo_task_refine
+  - neo_task_cancel
+  - neo_task_frame_follow_up
+  - neo_task_open
+provides_hooks:
+  - pre_llm_call

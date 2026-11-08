@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import tools  # noqa: E402
+import neo_tools as tools  # noqa: E402
 from events import TaskService  # noqa: E402
 from registry import Registry, TaskNotFoundError  # noqa: E402
 from state_machine import (  # noqa: E402
@@ -27,7 +27,7 @@ from state_machine import (  # noqa: E402
     IncompleteEvidenceError,
     InvalidTransitionError,
 )
-from tools import (  # noqa: E402
+from neo_tools import (  # noqa: E402
     InvalidWorkerTokenError,
     WorkerTaskTools,
     WorkerTokenStore,

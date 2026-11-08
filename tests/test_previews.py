@@ -42,7 +42,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import previews  # noqa: E402
-import tools  # noqa: E402
+import neo_tools as tools  # noqa: E402
 from previews import (  # noqa: E402
     DEFAULT_PREVIEW_MAX_BYTES,
     PREVIEW_MIME_TYPES,
