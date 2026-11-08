@@ -45,6 +45,7 @@ from blender import (
     BlenderPortBusyError,
     BlenderSliceError,
 )
+from browser import BrowserSliceError
 from events import TaskService
 from executors.base import ExecutorConfigError
 from executors.claude import ClaudeExecutor
@@ -368,6 +369,34 @@ def _prepare_blender(
         return None, _error("invalid_blender_task", str(error))
 
 
+def _prepare_browser(
+    runtime: "NeoRuntime",
+    intent: str,
+    conversation: str,
+    workdir: str,
+    task_id: str,
+) -> Tuple[Optional[dict], Optional[dict]]:
+    """Ask the injected browser slice for task fields, or refuse honestly.
+
+    A runtime without the slice keeps the legacy worker route. With the slice
+    present, preparation supplies the browser work order, the navigation
+    artifacts and the worker argv; nothing is launched or published here.
+    """
+
+    slice_ = getattr(runtime, "browser", None)
+    if slice_ is None:
+        return None, None
+    try:
+        return (
+            slice_.prepare_task(intent, conversation, workdir, task_id=task_id),
+            None,
+        )
+    except BrowserSliceError as error:
+        return None, _error("browser_unavailable", str(error))
+    except (ExecutorConfigError, OSError, ValueError) as error:
+        return None, _error("invalid_browser_task", str(error))
+
+
 def _conversation_tasks(registry: Registry, conversation: str) -> List[dict]:
     """Return this conversation's tasks, newest first."""
     rows = [
@@ -491,6 +520,7 @@ class NeoRuntime:
         preview_root: Optional[Path] = None,
         clock: Callable[[], float] = time.time,
         blender: object = None,
+        browser: object = None,
     ) -> None:
         self.registry = registry
         self.service = service
@@ -503,6 +533,8 @@ class NeoRuntime:
         self.coding_executor = coding_executor
         self.blender = blender
         """The optional Blender slice; ``None`` keeps the legacy worker route."""
+        self.browser = browser
+        """The optional browser slice; ``None`` keeps the legacy worker route."""
         self.preview_root = (
             Path(preview_root) if preview_root is not None else self.data_dir / "previews"
         )
@@ -524,6 +556,7 @@ class NeoRuntime:
         max_parallel: Optional[int] = None,
         clock: Callable[[], float] = time.time,
         blender: object = None,
+        browser: object = None,
     ) -> "NeoRuntime":
         """Build the real service graph under NEO's plugin data directory."""
         data = Path(data_dir) if data_dir is not None else _plugin_data_dir()
@@ -566,6 +599,7 @@ class NeoRuntime:
             preview_root=preview_root,
             clock=clock,
             blender=blender,
+            browser=browser,
         )
 
     # -- workspace and prompts -------------------------------------------
@@ -712,6 +746,14 @@ class ConversationTools:
                 return refusal
             if prepared is not None:
                 expected = _merge_expected(expected, prepared.get("expected_artifacts"))
+        elif kind == "browser":
+            prepared, refusal = _prepare_browser(
+                runtime, intent, conversation, workdir, task_id
+            )
+            if refusal is not None:
+                return refusal
+            if prepared is not None:
+                expected = _merge_expected(expected, prepared.get("expected_artifacts"))
         try:
             task = runtime.service.create_task(
                 conversation_key=conversation,
@@ -750,10 +792,12 @@ class ConversationTools:
         try:
             if prepared is not None:
                 executor_name = prepared["executor"]
-                executor = runtime.worker_executor("blender")
+                executor = runtime.worker_executor(kind)
                 argv = list(prepared["argv"])
                 if not argv:
-                    raise ValueError("the Blender slice did not build a worker argv")
+                    raise ValueError(
+                        "the %s slice did not build a worker argv" % kind
+                    )
             elif executor_name == "claude":
                 session_id = executor.new_session_id()
                 argv = executor.build_initial_argv(

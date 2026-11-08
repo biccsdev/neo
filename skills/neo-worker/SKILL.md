@@ -76,6 +76,23 @@ is genuinely finished and the result files exist inside your task workdir.
   believe it should work. Only real, verified files count.
 - Never complete a task whose result you have not inspected.
 
+## Browser tasks
+
+When the task is a browser task, use Hermes' browser tools in a visible browser.
+This task is not headless; do not claim headless-only browsing and do not use a
+shell.
+
+- Navigate one harmless page (for example `https://example.com/`).
+- After each navigation write `browser-state.json` in your workdir with `url`,
+  `title` and `status`, capture `browser-screenshot.png` in the same workdir,
+  and publish the screenshot with `neo_task_publish_preview`.
+- Stop before any publish, send, post, email, upload, purchase, deploy, comment,
+  share or account action and report `needs_approval` with the exact action, the
+  account and the audience. A denial or timeout leaves the work unpublished.
+- Never log in, never authenticate and never handle credentials.
+- Completion is navigation evidence only. Approval never lets this worker
+  publish anything itself.
+
 ## Boundaries
 
 - Never spawn a nested NEO task or a second worker. One task, one worker.
