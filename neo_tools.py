@@ -56,6 +56,69 @@ TOKEN_BYTES = 32
 WORKER_TOKEN_REJECTED = "worker token rejected"
 """The one message a refused worker call may show: it names no task and no path."""
 
+REDACTED = "[REDACTED]"
+PATH_PLACEHOLDER = "[path]"
+
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)\b(NEO_TASK_TOKEN|NEO_TASK_ID|OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|HERMES_API_KEY|AWS_SECRET_ACCESS_KEY|API_KEY|TOKEN)\s*=\s*[^\s,;]+"),
+    re.compile(r"(?i)(Authorization:\s*Bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)([\"'](?:token|api_key|secret|password)[\"']\s*:\s*[\"'])[^\"']+"),
+    re.compile(r"(?i)\b(sk-|ghp_|xox[baprs]-|AKIA)[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+    re.compile(r"\[REDACTED PRIVATE KEY\]"),
+)
+_PATH_PATTERN = re.compile(
+    r"(?<![\w:/])(/(?:[^/\s\"'<>|]+)(?:/[^\s\"'<>|]+)+)"
+)
+
+
+def redact_text(text: object, cap: Optional[int] = None) -> str:
+    """Remove credential-shaped substrings and cap the result as UTF-8."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    cleaned = text
+    for pattern in _SECRET_PATTERNS:
+        if pattern.groups:
+            cleaned = pattern.sub(lambda m: m.group(1) + "=" + REDACTED, cleaned)
+        else:
+            cleaned = pattern.sub(REDACTED, cleaned)
+    cleaned = re.sub(r"/Users/[^/\s\"'<>]+", "~", cleaned)
+    if cap is not None:
+        cleaned = cap_text_bytes(cleaned, cap)
+    return cleaned
+
+
+def scrub_paths(text: object) -> str:
+    """Replace absolute filesystem paths while leaving URLs and relative names."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    def _replace_path(match):
+        value = match.group(1).rstrip("/")
+        name = Path(value).name
+        return PATH_PLACEHOLDER + ("/" + name if name else "")
+
+    return _PATH_PATTERN.sub(_replace_path, text)
+
+
+def cap_text_bytes(text: str, cap: int) -> str:
+    """Return at most ``cap`` UTF-8 bytes without splitting a character."""
+    if not isinstance(text, str) or isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
+        raise ValueError("cap must be a non-negative integer")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= cap:
+        return text
+    return encoded[:cap].decode("utf-8", errors="ignore")
+
+
+def workspace_label(workdir: object) -> Optional[str]:
+    """Return a basename for display, never an absolute path."""
+    if not isinstance(workdir, str) or not workdir.strip():
+        return None
+    name = Path(workdir.rstrip("/")).name
+    if not name:
+        return None
+    return "home" if name == Path.home().name else name
+
 DEFAULT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024
 """Two mebibytes, the default cap for one published preview image."""
 
@@ -662,8 +725,14 @@ __all__ = [
     "InvalidWorkerTokenError",
     "PREVIEW_EVENT",
     "PREVIEW_MIME_TYPES",
+    "PATH_PLACEHOLDER",
     "PreviewTooLargeError",
+    "REDACTED",
     "TOKEN_BYTES",
+    "cap_text_bytes",
+    "redact_text",
+    "scrub_paths",
+    "workspace_label",
     "WORKER_TOKEN_REJECTED",
     "WorkerBridge",
     "WorkerTaskTools",

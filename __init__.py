@@ -24,8 +24,13 @@ if str(_PLUGIN_DIR) not in sys.path:
 
 def register(ctx) -> None:
     """Wire NEO's conversational tools, middleware and bundled skill."""
-    from conversation import pre_llm_call, register_conversation_tools
+    from conversation import (
+        pre_llm_call,
+        register_capability_context,
+        register_conversation_tools,
+    )
 
+    register_capability_context(ctx)
     register_conversation_tools(ctx)
 
     register_hook = getattr(ctx, "register_hook", None)

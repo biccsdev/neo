@@ -130,6 +130,10 @@ class ConversationTestCase(unittest.TestCase):
             max_parallel=16,
         )
         self.supervisor.service = self.runtime.service
+        # Coding/general tests are independent of host capability discovery.
+        # Browser routing tests opt in explicitly; security tests exercise the
+        # fail-closed default separately.
+        self.runtime.browser_authorized = True
         self.tools = ConversationTools(lambda: self.runtime)
 
     def tearDown(self) -> None:

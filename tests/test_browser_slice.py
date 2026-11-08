@@ -86,6 +86,8 @@ class BrowserCase(unittest.TestCase):
             launcher=self.launch,
             approval=self.approval_notices.append,
         )
+        # This fixture explicitly represents a host with browser capability.
+        self.runtime.browser_authorized = True
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()

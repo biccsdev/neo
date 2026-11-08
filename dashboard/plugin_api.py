@@ -80,6 +80,7 @@ from presentation import (  # noqa: E402
     PresentationService,
     TaskPresenter,
 )
+from neo_tools import cap_text_bytes, redact_text, scrub_paths, workspace_label
 from previews import PreviewService  # noqa: E402
 from registry import Registry, TaskNotFoundError  # noqa: E402
 from state_machine import TERMINAL_STATES, TaskState  # noqa: E402
@@ -159,7 +160,6 @@ _TASK_FIELDS = (
     "state",
     "capability_id",
     "executor",
-    "workdir",
     "resource_key",
     "preview_rev",
     "version",
@@ -295,9 +295,33 @@ def _public_task(task: dict) -> dict:
     other internals, and none of them are reachable from this projection.
     """
     body = {field: task.get(field) for field in _TASK_FIELDS}
+    body["workspace"] = workspace_label(task.get("workdir"))
     body["expected"] = _decode_list(task.get("expected_json"))
     body["artifacts"] = _decode_list(task.get("artifacts_json"))
-    body["approval"] = _decode_dict(task.get("approval_json"))
+    approval = _decode_dict(task.get("approval_json"))
+    if approval is not None:
+        allowed = (
+            "decision",
+            "action",
+            "account",
+            "audience",
+            "reason",
+            "fingerprint",
+            "categories",
+            "publication",
+            "requires_approval",
+            "note",
+            "at",
+        )
+        approval = {key: approval.get(key) for key in allowed if key in approval}
+        for key in ("action", "account", "audience", "reason", "note"):
+            if isinstance(approval.get(key), str):
+                approval[key] = scrub_paths(approval[key])
+    body["approval"] = approval
+    body["result_summary"] = (
+        scrub_paths(task.get("result_summary") or "") or None
+    )
+    body["error_detail"] = scrub_paths(task.get("error_detail") or "") or None
     body["preview"] = {
         "published": bool(task.get("preview_path")),
         "rev": task.get("preview_rev"),
@@ -415,6 +439,11 @@ def _read_log_tail(services: Any, task: dict, tail: int) -> dict:
         resolved.relative_to(root)
     except ValueError:
         raise HTTPException(status_code=404, detail="task has no log") from None
+    allowed_names = {"%s.log" % task.get("id")}
+    if resolved.name == "task.log" and resolved.parent.name == task.get("id"):
+        allowed_names.add("task.log")
+    if resolved.name not in allowed_names:
+        raise HTTPException(status_code=404, detail="task has no log")
     cap = getattr(services, "log_max_bytes", _DEFAULT_LOG_MAX_BYTES)
     if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
         cap = _DEFAULT_LOG_MAX_BYTES
@@ -433,7 +462,16 @@ def _read_log_tail(services: Any, task: dict, tail: int) -> dict:
         # The first line began before the window, so it is a fragment.
         lines = lines[1:]
     truncated = drained or len(lines) > tail
-    return {"lines": lines[-tail:] if tail else lines, "tail": tail, "truncated": truncated}
+    rendered = cap_text_bytes(
+        scrub_paths(redact_text("\n".join(lines[-tail:] if tail else lines))), cap
+    )
+    return {
+        "lines": rendered.splitlines(),
+        "tail": tail,
+        "truncated": truncated or rendered.encode("utf-8").__len__() != len(
+            ("\n".join(lines[-tail:] if tail else lines)).encode("utf-8")
+        ),
+    }
 
 
 def _find_retry_child(registry: Any, task_id: str) -> Optional[dict]:

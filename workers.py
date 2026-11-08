@@ -114,6 +114,50 @@ class RecursionRefusedError(RuntimeError):
     """A NEO worker attempted to create another NEO worker."""
 
 
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_ENV_ESSENTIALS = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "NEO_PREVIEW_DIR",
+    "NEO_PREVIEW_MAX_BYTES",
+)
+
+
+def worker_environment(
+    task_id: str, token: Optional[str], *, environ: Optional[dict] = None
+) -> dict:
+    """Build the worker environment, optionally restricted by an allowlist.
+
+    The default inherits the caller's environment because Codex, Claude and
+    Hermes need their normal provider/auth configuration. Setting
+    ``NEO_WORKER_ENV_ALLOWLIST`` to a comma-separated list of variable names
+    keeps only that list plus NEO's essentials.
+    """
+    source = dict(os.environ if environ is None else environ)
+    raw = source.get("NEO_WORKER_ENV_ALLOWLIST")
+    if raw is not None:
+        names = [part.strip() for part in str(raw).split(",")] if str(raw).strip() else [""]
+        if any(not name or not _ENV_NAME.fullmatch(name) for name in names):
+            raise ValueError("NEO_WORKER_ENV_ALLOWLIST contains an invalid name")
+        keep = set(_ENV_ESSENTIALS) | set(names)
+        environment = {key: value for key, value in source.items() if key in keep}
+    else:
+        environment = source
+    environment.update({"NEO_WORKER": "1", "NEO_TASK_ID": task_id})
+    if token is not None:
+        environment["NEO_TASK_TOKEN"] = token
+    return environment
+
+
 class ProcessSupervisor:
     """Supervise one service's task subprocesses."""
 
@@ -180,14 +224,7 @@ class ProcessSupervisor:
         try:
             token = self._tokens.issue(task_id)
             self._log_dir.mkdir(parents=True, exist_ok=True)
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "NEO_WORKER": "1",
-                    "NEO_TASK_ID": task_id,
-                    "NEO_TASK_TOKEN": token,
-                }
-            )
+            environment = worker_environment(task_id, token)
             with log_path.open("ab", buffering=0) as log:
                 process = subprocess.Popen(
                     argv,

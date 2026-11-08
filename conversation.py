@@ -55,8 +55,8 @@ from executors.hermes_worker import HermesWorkerExecutor, NestedWorkerRefusedErr
 from presentation import MacOSOpener, PresentationService, TaskPresenter
 from registry import DuplicateTaskError, Registry, TaskNotFoundError
 from state_machine import TERMINAL_STATES
-from neo_tools import WorkerTokenStore
-from workers import ProcessSupervisor
+from neo_tools import WorkerTokenStore, scrub_paths
+from workers import ProcessSupervisor, worker_environment
 
 TOOLSET = "neo"
 WORKER_ENV = "NEO_WORKER"
@@ -139,8 +139,11 @@ _KIND_HINTS = (
 
 
 def _error(code: str, detail: str, **extra: object) -> dict:
-    """Return one JSON-safe refusal."""
-    payload = {"ok": False, "error": {"code": code, "detail": detail}}
+    """Return one JSON-safe refusal with absolute paths removed."""
+    payload = {
+        "ok": False,
+        "error": {"code": code, "detail": scrub_paths(detail)},
+    }
     payload.update(extra)
     return payload
 
@@ -522,6 +525,7 @@ class NeoRuntime:
         clock: Callable[[], float] = time.time,
         blender: object = None,
         browser: object = None,
+        capabilities: object = None,
     ) -> None:
         self.registry = registry
         self.service = service
@@ -536,6 +540,10 @@ class NeoRuntime:
         """The optional Blender slice; ``None`` keeps the legacy worker route."""
         self.browser = browser
         """The optional browser slice; ``None`` keeps the legacy worker route."""
+        self.capabilities = capabilities
+        """Captured public capability lookups; ``None`` means fail closed."""
+        self.browser_authorized = False
+        """Explicit test/embedding opt-in; production checks the live bridge."""
         self.preview_root = (
             Path(preview_root) if preview_root is not None else self.data_dir / "previews"
         )
@@ -558,6 +566,7 @@ class NeoRuntime:
         clock: Callable[[], float] = time.time,
         blender: object = None,
         browser: object = None,
+        capabilities: object = None,
     ) -> "NeoRuntime":
         """Build the real service graph under NEO's plugin data directory."""
         data = Path(data_dir) if data_dir is not None else _plugin_data_dir()
@@ -591,6 +600,7 @@ class NeoRuntime:
         )
         if selected not in CODING_EXECUTORS:
             selected = "codex"
+        capabilities = capabilities or current_capability_context()
         runtime = cls(
             registry=registry,
             service=service,
@@ -606,9 +616,16 @@ class NeoRuntime:
             clock=clock,
             blender=blender,
             browser=browser,
+            capabilities=capabilities,
         )
         if runtime.blender is None:
-            runtime.blender = BlenderSlice(runtime=runtime)
+            runtime.blender = BlenderSlice(
+                runtime=runtime,
+                discovery=capabilities.discovery() if capabilities else None,
+            )
+        # Do not cache production authorization: a plugin can be disabled
+        # between submission and follow-up. Tests may opt in explicitly.
+        runtime.browser_authorized = False
         if runtime.browser is None:
             runtime.browser = BrowserSlice(runtime=runtime, clock=clock)
         return runtime
@@ -657,7 +674,7 @@ class NeoRuntime:
         log_dir = self.data_dir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / ("%s-follow-up.log" % _safe_component(task_id))
-        environment = os.environ.copy()
+        environment = worker_environment(task_id, None)
         environment[WORKER_ENV] = WORKER_FLAG_VALUE
         with log_path.open("ab", buffering=0) as log:
             return subprocess.Popen(
@@ -674,6 +691,128 @@ class NeoRuntime:
 
 _RUNTIME: Optional[NeoRuntime] = None
 _RUNTIME_LOCK = threading.Lock()
+# Registration and runtime publication are one profile-switch transaction.
+_CAPABILITY_LOCK = _RUNTIME_LOCK
+_CAPABILITY_CONTEXT = None
+
+
+class CapabilityBridge:
+    """Snapshot of the host's public capability lookups for this profile."""
+
+    def __init__(
+        self,
+        *,
+        has_plugin=None,
+        is_plugin_enabled=None,
+        find_skills=None,
+        install_plugin=None,
+        installed_sha=None,
+    ) -> None:
+        self._has_plugin = has_plugin if callable(has_plugin) else (lambda name: False)
+        self._is_enabled = (
+            is_plugin_enabled
+            if callable(is_plugin_enabled)
+            else (lambda name: bool(self._has_plugin(name)))
+        )
+        self._find_skills = find_skills if callable(find_skills) else (lambda: ())
+        self._install_plugin = install_plugin if callable(install_plugin) else None
+        self._installed_sha = installed_sha if callable(installed_sha) else (lambda name: None)
+
+    def has_plugin(self, name: str) -> bool:
+        try:
+            return bool(self._has_plugin(name))
+        except Exception:
+            return False
+
+    def is_plugin_enabled(self, name: str) -> bool:
+        try:
+            return bool(self._is_enabled(name))
+        except Exception:
+            return False
+
+    def find_skills(self) -> list:
+        try:
+            return list(self._find_skills())
+        except Exception:
+            return []
+
+    def browser_ready(self) -> bool:
+        """A browser plugin/skill must be visibly present; core is not assumed."""
+        try:
+            for row in self.find_skills():
+                if isinstance(row, Mapping):
+                    name = row.get("name")
+                    enabled = row.get("enabled", True)
+                else:
+                    name = getattr(row, "name", None)
+                    enabled = getattr(row, "enabled", True)
+                if name == "browser" and enabled:
+                    return True
+        except Exception:
+            pass
+        for name in ("browser", "browser-browse"):
+            if self.is_plugin_enabled(name):
+                return True
+        return False
+
+    def installed_sha(self, name: str):
+        try:
+            return self._installed_sha(name)
+        except Exception:
+            return None
+
+    def _discovery_has_plugin(self, name: str) -> bool:
+        if name == "blender":
+            from capabilities import OFFICIAL_BLENDER
+
+            if self.installed_sha(name) != OFFICIAL_BLENDER.sha:
+                return False
+        return self.has_plugin(name)
+
+    def discovery(self):
+        from capabilities import CapabilityDiscovery
+
+        return CapabilityDiscovery(
+            has_plugin=self._discovery_has_plugin,
+            is_plugin_enabled=self.is_plugin_enabled,
+            find_skills=self.find_skills,
+            installer=self._install_plugin,
+        )
+
+    def list_installed(self, names=None):
+        """Delegate installed capability reporting to a fresh discovery."""
+        return self.discovery().list_installed(names)
+
+
+def register_capability_context(ctx) -> Optional[CapabilityBridge]:
+    """Capture public lookups from a plugin context; replace any old profile."""
+    global _CAPABILITY_CONTEXT, _RUNTIME
+    bridge = CapabilityBridge(
+        has_plugin=getattr(ctx, "has_plugin", None),
+        is_plugin_enabled=getattr(ctx, "is_plugin_enabled", None),
+        find_skills=getattr(ctx, "find_skills", None),
+        install_plugin=getattr(ctx, "install_plugin", None),
+        installed_sha=(
+            getattr(ctx, "get_installed_sha", None)
+            or getattr(ctx, "installed_sha", None)
+        ),
+    )
+    with _CAPABILITY_LOCK:
+        _CAPABILITY_CONTEXT = bridge
+        _RUNTIME = None
+    return bridge
+
+
+def current_capability_context() -> Optional[CapabilityBridge]:
+    with _CAPABILITY_LOCK:
+        return _CAPABILITY_CONTEXT
+
+
+def reset_capability_context() -> None:
+    global _CAPABILITY_CONTEXT, _RUNTIME
+    with _CAPABILITY_LOCK:
+        _CAPABILITY_CONTEXT = None
+        _RUNTIME = None
 
 
 def get_runtime() -> NeoRuntime:
@@ -758,6 +897,15 @@ class ConversationTools:
             if prepared is not None:
                 expected = _merge_expected(expected, prepared.get("expected_artifacts"))
         elif kind == "browser":
+            authorized = bool(getattr(runtime, "browser_authorized", False)) or bool(
+                getattr(runtime, "capabilities", None)
+                and runtime.capabilities.browser_ready()
+            )
+            if not authorized:
+                return _error(
+                    "browser_unavailable",
+                    "No enabled browser capability is available in this Hermes profile.",
+                )
             prepared, refusal = _prepare_browser(
                 runtime, intent, conversation, workdir, task_id
             )
@@ -857,8 +1005,23 @@ class ConversationTools:
                 "NEO workers cannot start another NEO task; finish this task instead.",
                 task_id=row["id"],
             )
+        except Exception as error:
+            failed = _fail(runtime, row, "spawn_failed", str(error))
+            return _error(
+                "executor_unavailable",
+                "The task was recorded but its executor could not start.",
+                task_id=failed["id"],
+                state=failed["state"],
+            )
 
         final = runtime.service.get_task(row["id"]) or row
+        if final.get("state") == "failed":
+            return _error(
+                "executor_unavailable",
+                "The task was recorded but its executor failed to start.",
+                task_id=final["id"],
+                state=final["state"],
+            )
         payload = _submitted(runtime, final, deduplicated=False)
         payload["expected_artifacts"] = list(expected)
         if prepared is not None:
@@ -888,7 +1051,7 @@ class ConversationTools:
         if task.get("error_code") or task.get("error_detail"):
             error = {
                 "code": task.get("error_code"),
-                "detail": _short(task.get("error_detail"), 400),
+                "detail": scrub_paths(_short(task.get("error_detail"), 400) or ""),
             }
         created = task.get("created_at")
         age = runtime.clock() - created if isinstance(created, (int, float)) else 0.0
@@ -914,7 +1077,7 @@ class ConversationTools:
                 or int(task.get("preview_rev") or 0) > 0,
                 "rev": int(task.get("preview_rev") or 0),
             },
-            "summary": task.get("result_summary"),
+            "summary": scrub_paths(task.get("result_summary") or ""),
             "age_seconds": round(float(age), 3),
             "created_at": created,
             "updated_at": task.get("updated_at"),
@@ -1273,7 +1436,7 @@ class ConversationTools:
             "task_id": task["id"],
             "presented": presented,
             "skipped": bool(outcome.get("skipped", not presented)),
-            "reason": outcome.get("reason") or "",
+            "reason": scrub_paths(outcome.get("reason") or ""),
         }
 
 

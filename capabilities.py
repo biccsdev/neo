@@ -1114,15 +1114,15 @@ class CapabilityDiscovery:
             extra_args=extra_args,
             hermes_bin=self._hermes_bin,
         )
-        if self._installer is None:
-            return InstallResult(
-                installed=False, name=request.name, sha=request.sha,
-                reason="no installer is configured", installer_called=False,
-            )
         consent = self._store.find(request.name, request.sha)
         if consent is None or not consent.matches(request.name, request.sha):
             raise ConsentRequiredError(
                 "consent is required for %s at %s" % (request.name, request.sha)
+            )
+        if self._installer is None:
+            return InstallResult(
+                installed=False, name=request.name, sha=request.sha,
+                reason="no installer is configured", installer_called=False,
             )
 
         try:

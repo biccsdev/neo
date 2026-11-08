@@ -187,6 +187,8 @@ class ParallelCase(unittest.TestCase):
         self.codex = FakeCodingExecutor()
         self.runtime.codex = self.codex
         self.runtime.coding_executor = "codex"
+        # The fake browser represents an explicitly authorised host capability.
+        self.runtime.browser_authorized = True
         self.tools = ConversationTools(lambda: self.runtime)
         self.addCleanup(self._cleanup_processes)
 

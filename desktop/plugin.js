@@ -726,7 +726,7 @@ function NeoDetail({
     { label: 'Capability', value: task.capability_id || 'Not recorded' },
     { label: 'Executor', value: task.executor || 'Not recorded' },
     { label: 'Native session', value: nativeSessionId(task) },
-    { label: 'Workspace', value: task.workdir || 'Not recorded' },
+    { label: 'Workspace', value: task.workspace || 'Not recorded' },
     { label: 'Progress', value: progressLabel(task) },
     { label: 'Approval', value: approvalLabel(task) },
     { label: 'Created', value: formatClock(task.created_at) },

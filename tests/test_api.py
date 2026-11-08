@@ -485,9 +485,11 @@ class LogTailTests(APITestCase):
         )
 
     def test_log_tail_is_bounded_and_relative(self) -> None:
-        path = self.log_root / "task.log"
+        task = self.create()
+        path = self.log_root / task["id"] / "task.log"
+        path.parent.mkdir()
         path.write_bytes(b"one\ntwo\nthree\n")
-        task = self.attach_log(self.create(), path)
+        task = self.attach_log(task, path)
         body = self.assert_json(
             self.client().get(PREFIX + "/tasks/" + task["id"] + "/log", params={"tail": 2})
         )
@@ -497,9 +499,11 @@ class LogTailTests(APITestCase):
         self.assertNotIn(str(self.root), json.dumps(body))
 
     def test_log_tail_bounds_are_validated(self) -> None:
-        path = self.log_root / "task.log"
+        task = self.create()
+        path = self.log_root / task["id"] / "task.log"
+        path.parent.mkdir()
         path.write_bytes(b"one\n")
-        task = self.attach_log(self.create(), path)
+        task = self.attach_log(task, path)
         client = self.client()
         url = PREFIX + "/tasks/" + task["id"] + "/log"
         for tail in (0, 1001, -1, "many"):
