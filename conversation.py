@@ -40,6 +40,11 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 from uuid import uuid4
 
 import schemas
+from blender import (
+    BlenderNotReadyError,
+    BlenderPortBusyError,
+    BlenderSliceError,
+)
 from events import TaskService
 from executors.base import ExecutorConfigError
 from executors.claude import ClaudeExecutor
@@ -301,6 +306,68 @@ def _dedupe_key(kind: str, intent: str) -> str:
     return "%s:%s" % (kind, digest)
 
 
+def _merge_expected(
+    requested: Tuple[str, ...], defaults: object
+) -> Tuple[str, ...]:
+    """Keep the caller's expectations first, then the slice's fixed defaults."""
+
+    merged: List[str] = list(requested)
+    if isinstance(defaults, (list, tuple)):
+        for name in defaults:
+            if isinstance(name, str) and name.strip() and name not in merged:
+                merged.append(name.strip())
+    return tuple(merged)
+
+
+def _prepare_blender(
+    runtime: "NeoRuntime",
+    intent: str,
+    conversation: str,
+    workdir: str,
+    task_id: str,
+) -> Tuple[Optional[dict], Optional[dict]]:
+    """Ask the injected Blender slice for task fields, or refuse honestly.
+
+    A runtime without the slice keeps the legacy worker route: the same
+    ``hermes_worker`` submission this module used before Task 19. With the slice
+    present, a missing or disabled plugin returns ``needs_approval`` plus the
+    pinned disclosure and nothing is created or launched.
+    """
+
+    slice_ = getattr(runtime, "blender", None)
+    if slice_ is None:
+        return None, None
+    try:
+        return (
+            slice_.prepare_task(intent, conversation, workdir, task_id=task_id),
+            None,
+        )
+    except BlenderNotReadyError as error:
+        decision = getattr(error, "decision", {}) or {}
+        reason = decision.get("reason") or "Blender is not ready."
+        return None, _error(
+            "approval_required",
+            "Blender needs approval before NEO can start it: %s" % reason,
+            state="needs_approval",
+            requires_approval=True,
+            capability="blender",
+            reason=reason,
+            disclosure=decision.get("disclosure"),
+            plugin=decision.get("plugin"),
+            app=decision.get("app"),
+        )
+    except BlenderPortBusyError as error:
+        return None, _error(
+            "blender_port_busy",
+            str(error),
+            port=getattr(error, "status", None),
+        )
+    except BlenderSliceError as error:
+        return None, _error("blender_unavailable", str(error))
+    except (ExecutorConfigError, OSError, ValueError) as error:
+        return None, _error("invalid_blender_task", str(error))
+
+
 def _conversation_tasks(registry: Registry, conversation: str) -> List[dict]:
     """Return this conversation's tasks, newest first."""
     rows = [
@@ -423,6 +490,7 @@ class NeoRuntime:
         coding_executor: str = "codex",
         preview_root: Optional[Path] = None,
         clock: Callable[[], float] = time.time,
+        blender: object = None,
     ) -> None:
         self.registry = registry
         self.service = service
@@ -433,6 +501,8 @@ class NeoRuntime:
         self.claude = claude
         self.hermes_worker = hermes_worker
         self.coding_executor = coding_executor
+        self.blender = blender
+        """The optional Blender slice; ``None`` keeps the legacy worker route."""
         self.preview_root = (
             Path(preview_root) if preview_root is not None else self.data_dir / "previews"
         )
@@ -453,6 +523,7 @@ class NeoRuntime:
         coding_executor: Optional[str] = None,
         max_parallel: Optional[int] = None,
         clock: Callable[[], float] = time.time,
+        blender: object = None,
     ) -> "NeoRuntime":
         """Build the real service graph under NEO's plugin data directory."""
         data = Path(data_dir) if data_dir is not None else _plugin_data_dir()
@@ -494,6 +565,7 @@ class NeoRuntime:
             coding_executor=selected,
             preview_root=preview_root,
             clock=clock,
+            blender=blender,
         )
 
     # -- workspace and prompts -------------------------------------------
@@ -630,6 +702,16 @@ class ConversationTools:
         task_id = uuid4().hex
         requested = _safe_workdir(args.get("workdir"))
         workdir = requested or runtime.workspace(task_id)
+
+        prepared: Optional[dict] = None
+        if kind == "blender":
+            prepared, refusal = _prepare_blender(
+                runtime, intent, conversation, workdir, task_id
+            )
+            if refusal is not None:
+                return refusal
+            if prepared is not None:
+                expected = _merge_expected(expected, prepared.get("expected_artifacts"))
         try:
             task = runtime.service.create_task(
                 conversation_key=conversation,
@@ -638,7 +720,11 @@ class ConversationTools:
                 workdir=workdir,
                 task_id=task_id,
                 dedupe_key=dedupe,
-                resource_key=BLENDER_RESOURCE_KEY if kind == "blender" else None,
+                resource_key=(
+                    prepared["resource_key"]
+                    if prepared is not None
+                    else (BLENDER_RESOURCE_KEY if kind == "blender" else None)
+                ),
             )
         except DuplicateTaskError:
             existing = _active_duplicate(runtime, conversation, dedupe)
@@ -662,7 +748,13 @@ class ConversationTools:
         )
         session_id: Optional[str] = None
         try:
-            if executor_name == "claude":
+            if prepared is not None:
+                executor_name = prepared["executor"]
+                executor = runtime.worker_executor("blender")
+                argv = list(prepared["argv"])
+                if not argv:
+                    raise ValueError("the Blender slice did not build a worker argv")
+            elif executor_name == "claude":
                 session_id = executor.new_session_id()
                 argv = executor.build_initial_argv(
                     intent, workdir=workdir, session_id=session_id
@@ -714,6 +806,9 @@ class ConversationTools:
         final = runtime.service.get_task(row["id"]) or row
         payload = _submitted(runtime, final, deduplicated=False)
         payload["expected_artifacts"] = list(expected)
+        if prepared is not None:
+            payload["capability"] = prepared["capability"]
+            payload["resource_key"] = prepared["resource_key"]
         return payload
 
     # -- status ----------------------------------------------------------

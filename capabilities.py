@@ -169,6 +169,30 @@ def _official_blender() -> Capability:
 OFFICIAL_BLENDER = _official_blender()
 """Pinned official ``blender`` capability used for disclosure and routing."""
 
+BLENDER_DISCLOSURE_POINTS = (
+    "The Blender worker's tools execute arbitrary Python inside Blender; NEO "
+    "does not sandbox that code or limit which files Blender can reach.",
+    "The Blender session is online: the worker's model provider receives the "
+    "task text and whatever scene data the worker reads.",
+    "The plugin's local bridge listens on unauthenticated 127.0.0.1:9876 while "
+    "Blender is open, so any local process can drive that session.",
+    "Installing downloads the pinned plugin package from the catalog. The "
+    "download size is not pinned in advance; the installer reports it.",
+)
+"""Everything the user must see before consenting to the Blender capability."""
+
+
+def blender_disclosure(capability: Optional[Capability] = None) -> dict:
+    """Return the pinned Blender disclosure: identity, pin and every risk."""
+
+    cap = capability or OFFICIAL_BLENDER
+    data = cap.to_dict()
+    data["pinned"] = True
+    data["consent_required"] = True
+    data["points"] = list(BLENDER_DISCLOSURE_POINTS)
+    return data
+
+
 
 @dataclass(frozen=True)
 class InstalledCapability:
@@ -1002,19 +1026,22 @@ class CapabilityDiscovery:
                 "route": "hermes_worker",
                 "capability": "blender",
                 "skill": "blender:blender",
+                "installed": True,
+                "enabled": True,
                 "requires_approval": False,
                 "disclosure": None,
             }
 
         disclosure = None
         if self._official_blender is not None:
-            disclosure = self._official_blender.to_dict()
-            disclosure["pinned"] = True
+            disclosure = blender_disclosure(self._official_blender)
         return {
             "status": "needs_approval",
             "route": None,
             "capability": "blender",
             "skill": None,
+            "installed": installed,
+            "enabled": enabled,
             "requires_approval": True,
             "reason": (
                 "the official blender plugin is not installed and enabled"
