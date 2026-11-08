@@ -282,20 +282,23 @@ class SubmitTaskTests(ConversationTestCase):
         prompt_path = Path(argv[argv.index("--query-file") + 1])
         self.assertTrue(prompt_path.is_file())
         self.assertIn("open the local docs page", prompt_path.read_text(encoding="utf-8"))
-        self.assertEqual(argv[argv.index("--skills") + 1], "neo-worker")
+        self.assertEqual(argv[argv.index("--skills") + 1], "browser,neo-worker")
 
-    def test_blender_submission_preloads_the_official_skill_and_locks_the_port(self) -> None:
+    def test_blender_submission_waits_for_the_pinned_plugin_approval(self) -> None:
         body = self.call(
             "neo_submit_task",
             {"intent": "make a low-poly rocket in Blender", "kind": "blender"},
             session_id="session-1",
         )
 
-        self.assertTrue(body["ok"], body)
-        argv = self.launch.last()["argv"]
-        self.assertEqual(argv[argv.index("--skills") + 1], "blender:blender,neo-worker")
-        task = self.runtime.registry.get_task(body["task_id"])
-        self.assertEqual(task["resource_key"], "blender:9876")
+        self.assertFalse(body["ok"], body)
+        self.assertEqual(body["state"], "needs_approval")
+        self.assertEqual(body["capability"], "blender")
+        self.assertEqual(self.launch.calls, [])
+        tasks = [
+            row for row in self.runtime.registry.list_tasks() if row["kind"] == "blender"
+        ]
+        self.assertEqual(tasks, [])
 
     def test_auto_kind_infers_coding_from_the_intent(self) -> None:
         body = self.call(

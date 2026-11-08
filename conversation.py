@@ -43,9 +43,10 @@ import schemas
 from blender import (
     BlenderNotReadyError,
     BlenderPortBusyError,
+    BlenderSlice,
     BlenderSliceError,
 )
-from browser import BrowserSliceError
+from browser import BrowserSlice, BrowserSliceError
 from events import TaskService
 from executors.base import ExecutorConfigError
 from executors.claude import ClaudeExecutor
@@ -585,7 +586,7 @@ class NeoRuntime:
         )
         if selected not in CODING_EXECUTORS:
             selected = "codex"
-        return cls(
+        runtime = cls(
             registry=registry,
             service=service,
             supervisor=supervisor,
@@ -601,6 +602,11 @@ class NeoRuntime:
             blender=blender,
             browser=browser,
         )
+        if runtime.blender is None:
+            runtime.blender = BlenderSlice(runtime=runtime)
+        if runtime.browser is None:
+            runtime.browser = BrowserSlice(runtime=runtime, clock=clock)
+        return runtime
 
     # -- workspace and prompts -------------------------------------------
 

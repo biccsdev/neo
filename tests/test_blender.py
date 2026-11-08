@@ -730,11 +730,11 @@ class ConversationRoutingTests(unittest.TestCase):
         self.submit("make a low-poly rocket")
         self.assertEqual(installer.requests, [])
 
-    def test_without_a_slice_the_legacy_worker_route_still_runs(self) -> None:
+    def test_default_runtime_requires_the_pinned_plugin_approval(self) -> None:
         body = self.submit("make a low-poly rocket")
-        self.assertTrue(body["ok"], body)
-        argv = self.launch.last()["argv"]
-        self.assertEqual(argv[argv.index("--skills") + 1], "blender:blender,neo-worker")
+        self.assertFalse(body["ok"], body)
+        self.assertEqual(body["state"], "needs_approval")
+        self.assertEqual(self.launch.calls, [])
 
 
 if __name__ == "__main__":

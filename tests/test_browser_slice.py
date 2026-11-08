@@ -588,11 +588,11 @@ class ConversationRoutingTests(BrowserCase):
         prompt_path = Path(argv[argv.index("--query-file") + 1])
         self.assertIn("example.com", prompt_path.read_text(encoding="utf-8"))
 
-    def test_without_the_slice_the_legacy_worker_route_keeps_running(self) -> None:
+    def test_default_runtime_uses_the_browser_slice(self) -> None:
         body = self.submit("open the local docs page in a browser")
         self.assertTrue(body["ok"], body)
         argv = self.launch.last()["argv"]
-        self.assertEqual(argv[argv.index("--skills") + 1], "neo-worker")
+        self.assertEqual(argv[argv.index("--skills") + 1], "browser,neo-worker")
 
     def test_browser_slice_refusal_creates_nothing(self) -> None:
         self.runtime.browser = BrowserSlice(runtime=None)
