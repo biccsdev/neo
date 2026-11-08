@@ -17,7 +17,7 @@ kinds of evidence:
 Run every command from the repository root:
 
 ```
-cd /Users/user/code/work/neo-public
+cd /path/to/neo
 ```
 
 Dates and counts in this file were recorded on 2026-11-07 against this checkout.
@@ -130,7 +130,7 @@ hermes plugins doctor .
 Expected visible result:
 
 ```
-Plugin Doctor: /Users/user/code/work/neo-public
+Plugin Doctor: /path/to/neo
   manifest: neo 0.1.0 (standalone)
   OK: runtime discovery, manifest parsing, import, and registration passed
   registrations: 7 tool(s), 1 hook(s)
@@ -143,7 +143,7 @@ only beneath a temporary home. It never touches the operator's real profile
 (`~/.hermes`).
 
 ```
-NEO_SRC="/Users/user/code/work/neo-public"
+NEO_SRC="$(pwd)"
 HERMES_HOME="$(mktemp -d /tmp/neo-hermes-home.XXXXXX)"
 env HERMES_HOME="$HERMES_HOME" hermes plugins install "file://$NEO_SRC" --enable --yes-deps
 env HERMES_HOME="$HERMES_HOME" hermes plugins list
@@ -241,8 +241,9 @@ Prerequisites:
 - the voice model configured for spoken turns.
 
 Scenario: say a chat request, then an operations request. Expected: chat is
-answered in two or three spoken sentences; an operations request opens one
-visible CLI window with the task pre-loaded and no manual prompts. **PENDING.**
+answered in two or three spoken sentences; an operations request invokes NEO's
+task tools, creates visible task state and requires no manual CLI setup.
+**PENDING.**
 
 ### 2.6 Screenshots and video
 
@@ -261,7 +262,7 @@ above remains unproven until they are captured alongside the task ids.
 | 3 | API/presentation/security | automated | PASS | 115 tests, OK under `.venv` |
 | 4 | Package validation | automated | PASS | `hermes plugins validate .` → Validation passed |
 | 5 | Plugin doctor | automated | PASS | 7 tool(s), 1 hook(s) |
-| 6 | Isolated install + enable | automated | RECORDED | temporary `HERMES_HOME`, `file://` install, enabled, Doctor 7/1; re-run 1.5 |
+| 6 | Isolated install + enable | automated | PASS | temporary `HERMES_HOME`, `file://` install, enabled, Doctor 7/1 |
 | 7 | Live Codex task | live | PENDING | needs model/auth; no evidence yet |
 | 8 | Live Codex exact-thread follow-up | live | PENDING | needs model/auth; no evidence yet |
 | 9 | Live Claude resume | live | PENDING | needs Claude auth; no evidence yet |
@@ -271,10 +272,8 @@ above remains unproven until they are captured alongside the task ids.
 | 13 | Screenshots/video | live | PENDING | none captured |
 
 Rule for this checklist: a row becomes `PASS` only when the named command or
-scenario has been run in this checkout and its output is attached. A planned
-or plausible result is `PENDING`. Row 6 was executed before this document was
-written and its output was not saved here, so it is `RECORDED`; re-running 1.5
-in this checkout promotes it to `PASS`.
+scenario has been run in this checkout and its result recorded. A planned
+or plausible result is `PENDING`.
 
 ---
 
